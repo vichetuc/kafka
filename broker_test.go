@@ -16,12 +16,12 @@ var _ = Suite(&BrokerSuite{})
 
 func Test(t *testing.T) { TestingT(t) }
 
-type BrokerSuite struct {
-	l *testLogger
-}
+type BrokerSuite struct{}
 
 func (s *BrokerSuite) SetUpTest(c *C) {
-	s.l = &testLogger{c: c}
+	if log == nil {
+		SetLogger(&testLogger{c: c})
+	}
 }
 
 // testLogger prints everything using the gocheck output so we capture output with the
@@ -63,7 +63,6 @@ func (s *BrokerSuite) newTestBrokerConf(clientID string) BrokerConf {
 	conf.DialTimeout = 400 * time.Millisecond
 	conf.LeaderRetryLimit = 10
 	conf.LeaderRetryWait = 2 * time.Millisecond
-	conf.Logger = s.l
 	return conf
 }
 
@@ -814,11 +813,11 @@ func (s *BrokerSuite) TestPartitionCount(c *C) {
 	broker, err := Dial([]string{srv.Address()}, s.newTestBrokerConf("tester"))
 	c.Assert(err, IsNil)
 
-	count, err := broker.PartitionCount("test")
+	count, err := broker.metadata.PartitionCount("test")
 	c.Assert(err, IsNil)
 	c.Assert(count, Equals, int32(2))
 
-	count, err = broker.PartitionCount("test2")
+	count, err = broker.metadata.PartitionCount("test2")
 	c.Assert(err, NotNil)
 	c.Assert(count, Equals, int32(0))
 }
@@ -1039,10 +1038,10 @@ func (s *BrokerSuite) TestLeaderConnectionFailover(c *C) {
 	c.Assert(broker, NotNil)
 	c.Assert(err, IsNil)
 
-	_, err = broker.muLeaderConnection("does-not-exist", 123456)
+	_, err = broker.leaderConnection("does-not-exist", 123456)
 	c.Assert(err, Equals, proto.ErrUnknownTopicOrPartition)
 
-	conn, err := broker.muLeaderConnection("test", 0)
+	conn, err := broker.leaderConnection("test", 0)
 	c.Assert(conn, NotNil)
 	c.Assert(err, IsNil)
 
@@ -1052,17 +1051,20 @@ func (s *BrokerSuite) TestLeaderConnectionFailover(c *C) {
 	c.Assert(nodeID, Equals, int32(1))
 
 	srv1.Close()
-	broker.muCloseDeadConnection(conn)
 
-	_, err = broker.muLeaderConnection("test", 0)
+	_, err = broker.leaderConnection("test", 0)
 	c.Assert(err, NotNil)
 
 	// provide node address that will be available after short period
 	broker.metadata.nodes = map[int32]string{
-		2: fmt.Sprintf("%s:%d", host2, port2),
+		2: srv2.Address(),
 	}
 
-	_, err = broker.muLeaderConnection("test", 0)
+	// Add server2 to the connection map (dirty hack to make this test)
+	// work, else we might have gotten metadata from node2 to begin with
+	broker.conns.InitializeAddrs([]string{srv2.Address()})
+
+	_, err = broker.leaderConnection("test", 0)
 	c.Assert(err, IsNil)
 
 	nodeID, ok = broker.metadata.endpoints[tp]

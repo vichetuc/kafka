@@ -19,12 +19,17 @@ var ErrClosed = errors.New("closed")
 
 // Low level abstraction over connection to Kafka.
 type connection struct {
+	addr   string
 	rw     io.ReadWriteCloser
 	stop   chan struct{}
 	nextID chan int32
 
-	mu      sync.Mutex
-	respc   map[int32]chan []byte
+	// mu protects the following members. It must only be accessed by connection methods.
+	mu    *sync.Mutex
+	respc map[int32]chan []byte
+
+	// stopErr is set if and only if this connection has been closed. If set, it indicates
+	// the error that closed the connection.
 	stopErr error
 }
 
@@ -35,6 +40,8 @@ func newTCPConnection(address string, timeout time.Duration) (*connection, error
 		return nil, err
 	}
 	c := &connection{
+		addr:   address,
+		mu:     &sync.Mutex{},
 		stop:   make(chan struct{}),
 		nextID: make(chan int32),
 		rw:     conn,
@@ -69,11 +76,12 @@ func (c *connection) nextIDLoop() {
 func (c *connection) readRespLoop() {
 	defer func() {
 		c.mu.Lock()
+		defer c.mu.Unlock()
+
 		for _, cc := range c.respc {
 			close(cc)
 		}
 		c.respc = make(map[int32]chan []byte)
-		c.mu.Unlock()
 	}()
 
 	rd := bufio.NewReader(c.rw)
@@ -95,7 +103,7 @@ func (c *connection) readRespLoop() {
 		c.mu.Unlock()
 		if !ok {
 			log.Warn(
-				"msg", "response to unknown request",
+				"response to unknown request",
 				"correlationID", correlationID)
 			continue
 		}
@@ -127,7 +135,7 @@ func (c *connection) respWaiter(correlationID int32) (respc chan []byte, err err
 		return nil, c.stopErr
 	}
 	if _, ok := c.respc[correlationID]; ok {
-		log.Error("msg", "correlation conflict", "correlationID", correlationID)
+		log.Error("correlation conflict", "correlationID", correlationID)
 		return nil, fmt.Errorf("correlation conflict: %d", correlationID)
 	}
 	respc = make(chan []byte)
@@ -139,24 +147,34 @@ func (c *connection) respWaiter(correlationID int32) (respc chan []byte, err err
 // Calling this method for unknown correlationID has no effect.
 func (c *connection) releaseWaiter(correlationID int32) {
 	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	rc, ok := c.respc[correlationID]
 	if ok {
 		delete(c.respc, correlationID)
 		close(rc)
 	}
-	c.mu.Unlock()
 }
 
 // Close close underlying transport connection and cancel all pending response
 // waiters.
 func (c *connection) Close() error {
 	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	if c.stopErr == nil {
 		c.stopErr = ErrClosed
 		close(c.stop)
 	}
-	c.mu.Unlock()
 	return c.rw.Close()
+}
+
+// IsClosed returns whether or not this connection has been stopped/closed.
+func (c *connection) IsClosed() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.stopErr != nil
 }
 
 // Metadata sends given metadata request to kafka node and returns related
@@ -170,12 +188,12 @@ func (c *connection) Metadata(req *proto.MetadataReq) (*proto.MetadataResp, erro
 
 	respc, err := c.respWaiter(req.CorrelationID)
 	if err != nil {
-		log.Error("msg", "failed waiting for response", "error", err)
+		log.Error("failed waiting for response", "error", err)
 		return nil, fmt.Errorf("wait for response: %s", err)
 	}
 
 	if _, err := req.WriteTo(c.rw); err != nil {
-		log.Error("msg", "cannot write", "error", err)
+		log.Error("cannot write", "error", err)
 		c.releaseWaiter(req.CorrelationID)
 		return nil, err
 	}
@@ -203,12 +221,12 @@ func (c *connection) Produce(req *proto.ProduceReq) (*proto.ProduceResp, error) 
 
 	respc, err := c.respWaiter(req.CorrelationID)
 	if err != nil {
-		log.Error("msg", "failed waiting for response", "error", err)
+		log.Error("failed waiting for response", "error", err)
 		return nil, fmt.Errorf("wait for response: %s", err)
 	}
 
 	if _, err := req.WriteTo(c.rw); err != nil {
-		log.Error("msg", "cannot write", "error", err)
+		log.Error("cannot write", "error", err)
 		c.releaseWaiter(req.CorrelationID)
 		return nil, err
 	}
@@ -229,12 +247,12 @@ func (c *connection) Fetch(req *proto.FetchReq) (*proto.FetchResp, error) {
 
 	respc, err := c.respWaiter(req.CorrelationID)
 	if err != nil {
-		log.Error("msg", "failed waiting for response", "error", err)
+		log.Error("failed waiting for response", "error", err)
 		return nil, fmt.Errorf("wait for response: %s", err)
 	}
 
 	if _, err := req.WriteTo(c.rw); err != nil {
-		log.Error("msg", "cannot write", "error", err)
+		log.Error("cannot write", "error", err)
 		c.releaseWaiter(req.CorrelationID)
 		return nil, err
 	}
@@ -280,7 +298,7 @@ func (c *connection) Offset(req *proto.OffsetReq) (*proto.OffsetResp, error) {
 
 	respc, err := c.respWaiter(req.CorrelationID)
 	if err != nil {
-		log.Error("msg", "failed waiting for response", "error", err)
+		log.Error("failed waiting for response", "error", err)
 		return nil, fmt.Errorf("wait for response: %s", err)
 	}
 
@@ -288,14 +306,16 @@ func (c *connection) Offset(req *proto.OffsetReq) (*proto.OffsetResp, error) {
 	// -1 is for non node clients
 	req.ReplicaID = -1
 	if _, err := req.WriteTo(c.rw); err != nil {
-		log.Error("msg", "cannot write", "error", err)
+		log.Error("cannot write", "error", err)
 		c.releaseWaiter(req.CorrelationID)
 		return nil, err
 	}
+
 	b, ok := <-respc
 	if !ok {
 		return nil, c.stopErr
 	}
+
 	return proto.ReadOffsetResp(bytes.NewReader(b))
 }
 
@@ -306,11 +326,11 @@ func (c *connection) ConsumerMetadata(req *proto.ConsumerMetadataReq) (*proto.Co
 	}
 	respc, err := c.respWaiter(req.CorrelationID)
 	if err != nil {
-		log.Error("msg", "failed waiting for response", "error", err)
+		log.Error("failed waiting for response", "error", err)
 		return nil, fmt.Errorf("wait for response: %s", err)
 	}
 	if _, err := req.WriteTo(c.rw); err != nil {
-		log.Error("msg", "cannot write", "error", err)
+		log.Error("cannot write", "error", err)
 		c.releaseWaiter(req.CorrelationID)
 		return nil, err
 	}
@@ -328,11 +348,11 @@ func (c *connection) OffsetCommit(req *proto.OffsetCommitReq) (*proto.OffsetComm
 	}
 	respc, err := c.respWaiter(req.CorrelationID)
 	if err != nil {
-		log.Error("msg", "failed waiting for response", "error", err)
+		log.Error("failed waiting for response", "error", err)
 		return nil, fmt.Errorf("wait for response: %s", err)
 	}
 	if _, err := req.WriteTo(c.rw); err != nil {
-		log.Error("msg", "cannot write", "error", err)
+		log.Error("cannot write", "error", err)
 		c.releaseWaiter(req.CorrelationID)
 		return nil, err
 	}
@@ -350,11 +370,11 @@ func (c *connection) OffsetFetch(req *proto.OffsetFetchReq) (*proto.OffsetFetchR
 	}
 	respc, err := c.respWaiter(req.CorrelationID)
 	if err != nil {
-		log.Error("msg", "failed waiting for response", "error", err)
+		log.Error("failed waiting for response", "error", err)
 		return nil, fmt.Errorf("wait for response: %s", err)
 	}
 	if _, err := req.WriteTo(c.rw); err != nil {
-		log.Error("msg", "cannot write", "error", err)
+		log.Error("cannot write", "error", err)
 		c.releaseWaiter(req.CorrelationID)
 		return nil, err
 	}

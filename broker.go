@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jpillora/backoff"
 	"github.com/optiopay/kafka/proto"
 )
 
@@ -26,6 +27,11 @@ const (
 var (
 	// Logger used by the various components of the library
 	log Logger = &nullLogger{}
+
+	// Set up a new random source (by default Go doesn't seed it). This is not thread safe,
+	// so you must use the rndIntn method.
+	rnd   = rand.New(rand.NewSource(time.Now().UnixNano()))
+	rndmu = &sync.Mutex{}
 
 	// Returned by consumers on Fetch when the retry limit is set and exceeded.
 	ErrNoData = errors.New("no data")
@@ -87,13 +93,6 @@ func (tp topicPartition) String() string {
 	return fmt.Sprintf("%s:%d", tp.topic, tp.partition)
 }
 
-type clusterMetadata struct {
-	created    time.Time
-	nodes      map[int32]string         // node ID to address
-	endpoints  map[topicPartition]int32 // partition to leader node ID
-	partitions map[string]int32         // topic to number of partitions
-}
-
 type BrokerConf struct {
 	// Kafka client ID.
 	ClientID string
@@ -106,7 +105,8 @@ type BrokerConf struct {
 	LeaderRetryLimit int
 
 	// LeaderRetryWait sets a limit to the waiting time when trying to connect
-	// to a single node after failure.
+	// to a single node after failure. This is the initial time, we will do an
+	// exponential backoff with increasingly long durations.
 	//
 	// Defaults to 500ms.
 	//
@@ -133,38 +133,61 @@ type BrokerConf struct {
 	DialRetryLimit int
 
 	// DialRetryWait sets a limit to the waiting time when trying to establish
-	// broker connection to single node to fetch cluster metadata.
+	// broker connection to single node to fetch cluster metadata. This is subject to
+	// exponential backoff, so the second and further retries will be more than this
+	// value.
 	//
 	// Defaults to 500ms.
 	DialRetryWait time.Duration
 
-	// Logger is general logging interface that can be provided by popular
-	// logging frameworks. Used to notify and as replacement for stdlib `log`
-	// package.
-	Logger Logger
+	// IdleConnectionLimit sets a limit on how many currently idle connections can
+	// be open to each broker. Lowering this will reduce the number of unused connections
+	// to Kafka, but can result in extra latency during request spikes if connections
+	// are not available and have to be established.
+	//
+	// Defaults to 10.
+	IdleConnectionLimit int
+
+	// IdleConnectionWait sets a timeout on how long we should wait for a connection to
+	// become idle before we establish a new one. This value sets a cap on how much latency
+	// you're willing to add to a request before establishing a new connection.
+	//
+	// Default is 200ms.
+	IdleConnectionWait time.Duration
 }
 
 func NewBrokerConf(clientID string) BrokerConf {
 	return BrokerConf{
-		ClientID:           clientID,
-		DialTimeout:        10 * time.Second,
-		DialRetryLimit:     10,
-		DialRetryWait:      500 * time.Millisecond,
-		AllowTopicCreation: false,
-		LeaderRetryLimit:   10,
-		LeaderRetryWait:    500 * time.Millisecond,
-		Logger:             nil,
+		ClientID:            clientID,
+		DialTimeout:         10 * time.Second,
+		DialRetryLimit:      10,
+		DialRetryWait:       500 * time.Millisecond,
+		AllowTopicCreation:  false,
+		LeaderRetryLimit:    10,
+		LeaderRetryWait:     500 * time.Millisecond,
+		IdleConnectionLimit: 10,
+		IdleConnectionWait:  200 * time.Millisecond,
 	}
 }
+
+type nodeMap map[int32]string
 
 // Broker is an abstract connection to kafka cluster, managing connections to
 // all kafka nodes.
 type Broker struct {
 	conf BrokerConf
 
-	mu       sync.Mutex
-	metadata clusterMetadata
-	conns    map[int32]*connection
+	// mu protects all read/write accesses to the metadata/conns structures. This
+	// lock must not be held during network operations.
+	mu       *sync.Mutex
+	metadata *clusterMetadata
+	conns    *connectionPool
+}
+
+// SetLogger provides a logging instance. Should be called before any Dial or
+// other work is done to ensure everybody has the logger.
+func SetLogger(logger Logger) {
+	log = logger
 }
 
 // Dial connects to any node from a given list of kafka addresses and after
@@ -172,216 +195,67 @@ type Broker struct {
 //
 // The returned broker is not initially connected to any kafka node.
 func Dial(nodeAddresses []string, conf BrokerConf) (*Broker, error) {
+	pool := newConnectionPool(conf)
 	broker := &Broker{
+		mu:    &sync.Mutex{},
 		conf:  conf,
-		conns: make(map[int32]*connection),
-	}
-
-	// Set the global logger based on the one passed in if one has been set. Else, just use
-	// the global one -- by default a nullLogger.
-	if conf.Logger != nil {
-		log = conf.Logger
+		conns: pool,
+		metadata: &clusterMetadata{
+			mu:    &sync.RWMutex{},
+			conf:  conf,
+			conns: pool,
+		},
 	}
 
 	if len(nodeAddresses) == 0 {
 		return nil, errors.New("no addresses provided")
 	}
-	numAddresses := len(nodeAddresses)
 
-	for i := 0; i < conf.DialRetryLimit; i++ {
-		if i > 0 {
+	// Set up the pool
+	broker.conns.InitializeAddrs(nodeAddresses)
+
+	// Attempt to connect to the cluster but we want to do this with backoff and make sure we
+	// don't exceed the limits
+	retry := &backoff.Backoff{Min: conf.DialRetryWait, Jitter: true}
+	for try := 0; try < conf.DialRetryLimit; try++ {
+		if try > 0 {
+			sleepFor := retry.Duration()
 			log.Debug("cannot fetch metadata from any connection",
-				"retry", i,
-				"sleep", conf.DialRetryWait)
-			time.Sleep(conf.DialRetryWait)
+				"retry", try,
+				"sleep", sleepFor)
+			time.Sleep(sleepFor)
 		}
 
-		// This iterates starting at a random location in the slice, to prevent
-		// hitting the first server repeatedly
-		offset := rand.Intn(numAddresses)
-		for idx := 0; idx < numAddresses; idx++ {
-			addr := nodeAddresses[(idx+offset)%numAddresses]
-
-			conn, err := newTCPConnection(addr, conf.DialTimeout)
-			if err != nil {
-				log.Debug("cannot connect",
-					"address", addr,
-					"error", err)
-				continue
-			}
-			defer func(c *connection) {
-				_ = c.Close()
-			}(conn)
-			resp, err := conn.Metadata(&proto.MetadataReq{
-				ClientID: broker.conf.ClientID,
-				Topics:   nil,
-			})
-			if err != nil {
-				log.Debug("cannot fetch metadata",
-					"address", addr,
-					"error", err)
-				continue
-			}
-			if len(resp.Brokers) == 0 {
-				log.Debug("response with no broker data",
-					"address", addr)
-				continue
-			}
-			broker.cacheMetadata(resp)
-			return broker, nil
+		err := broker.metadata.Refresh()
+		if err != nil {
+			log.Error("cannot fetch metadata",
+				"error", err)
+			continue
 		}
+
+		// Metadata has been refreshed, so this broker is ready to go
+		return broker, nil
 	}
-	return nil, errors.New("cannot connect")
+	return nil, errors.New("cannot connect (exhausted retries)")
 }
 
 // Close closes the broker and all active kafka nodes connections.
 func (b *Broker) Close() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	for nodeID, conn := range b.conns {
-		if err := conn.Close(); err != nil {
-			log.Info("cannot close node connection",
-				"nodeID", nodeID,
-				"error", err)
-		}
-	}
+
+	b.conns.Close()
 }
 
+// Metadata returns a copy of the metadata. This does not require a lock as it's fetching
+// a new copy from Kafka, we never use our internal state.
 func (b *Broker) Metadata() (*proto.MetadataResp, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.fetchMetadata()
+	resp, err := b.metadata.Fetch()
+	return resp, err
 }
 
-// refreshMetadata is requesting metadata information from any node and refresh
-// internal cached representation.
-// Because it's changing internal state, this method requires lock protection,
-// but it does not acquire nor release lock itself.
-func (b *Broker) refreshMetadata() error {
-	meta, err := b.fetchMetadata()
-	if err == nil {
-		b.cacheMetadata(meta)
-	}
-	return err
-}
-
-// muRefreshMetadata calls refreshMetadata, but protects it with broker's lock.
-func (b *Broker) muRefreshMetadata() error {
-	b.mu.Lock()
-	err := b.refreshMetadata()
-	b.mu.Unlock()
-	return err
-}
-
-// fetchMetadata is requesting metadata information from any node and return
-// protocol response if successful
-//
-// If "topics" are specified, only fetch metadata for those topics (can be
-// used to create a topic)
-//
-// Because it's using metadata information to find node connections it's not
-// thread safe and using it require locking.
-func (b *Broker) fetchMetadata(topics ...string) (*proto.MetadataResp, error) {
-	checkednodes := make(map[int32]bool)
-
-	// try all existing connections first
-	for nodeID, conn := range b.conns {
-		checkednodes[nodeID] = true
-		resp, err := conn.Metadata(&proto.MetadataReq{
-			ClientID: b.conf.ClientID,
-			Topics:   topics,
-		})
-		if err != nil {
-			log.Debug("cannot fetch metadata from node",
-				"nodeID", nodeID,
-				"error", err)
-			continue
-		}
-		return resp, nil
-	}
-
-	// try all nodes that we know of that we're not connected to
-	for nodeID, addr := range b.metadata.nodes {
-		if _, ok := checkednodes[nodeID]; ok {
-			continue
-		}
-		conn, err := newTCPConnection(addr, b.conf.DialTimeout)
-		if err != nil {
-			log.Debug("cannot connect",
-				"address", addr,
-				"error", err)
-			continue
-		}
-		resp, err := conn.Metadata(&proto.MetadataReq{
-			ClientID: b.conf.ClientID,
-			Topics:   topics,
-		})
-
-		// we had no active connection to this node, so most likely we don't need it
-		_ = conn.Close()
-
-		if err != nil {
-			log.Debug("cannot fetch metadata from node",
-				"nodeID", nodeID,
-				"error", err)
-			continue
-		}
-		return resp, nil
-	}
-
-	return nil, errors.New("cannot fetch metadata. No topics created?")
-}
-
-// cacheMetadata creates new internal metadata representation using data from
-// given response. It's call has to be protected with lock.
-//
-// Do not call with partial metadata response, this assumes we have the full
-// set of metadata in the response
-func (b *Broker) cacheMetadata(resp *proto.MetadataResp) {
-	if !b.metadata.created.IsZero() {
-		log.Debug("rewriting old metadata",
-			"age", time.Now().Sub(b.metadata.created))
-	}
-	b.metadata = clusterMetadata{
-		created:    time.Now(),
-		nodes:      make(map[int32]string),
-		endpoints:  make(map[topicPartition]int32),
-		partitions: make(map[string]int32),
-	}
-	debugmsg := make([]interface{}, 0)
-	for _, node := range resp.Brokers {
-		addr := fmt.Sprintf("%s:%d", node.Host, node.Port)
-		b.metadata.nodes[node.NodeID] = addr
-		debugmsg = append(debugmsg, node.NodeID, addr)
-	}
-	for _, topic := range resp.Topics {
-		for _, part := range topic.Partitions {
-			dest := topicPartition{topic.Name, part.ID}
-			b.metadata.endpoints[dest] = part.Leader
-			debugmsg = append(debugmsg, dest, part.Leader)
-		}
-		b.metadata.partitions[topic.Name] = int32(len(topic.Partitions))
-	}
-	log.Debug("new metadata cached", debugmsg...)
-}
-
-// PartitionCount returns how many partitions a given topic has. If a topic
-// is not known, 0 and an error are returned.
-func (b *Broker) PartitionCount(topic string) (int32, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	count, ok := b.metadata.partitions[topic]
-	if ok {
-		return count, nil
-	}
-
-	return 0, fmt.Errorf("topic %s not found in metadata", topic)
-}
-
-// muLeaderConnection returns connection to leader for given partition. If
-// connection does not exist, broker will try to connect first and add store
-// connection for any further use.
+// leaderConnection returns connection to leader for given partition. If
+// connection does not exist, broker will try to connect.
 //
 // Failed connection retry is controlled by broker configuration.
 //
@@ -389,40 +263,41 @@ func (b *Broker) PartitionCount(topic string) (int32, error) {
 // the leader we will return a random broker. The broker will error if we end
 // up producing to it incorrectly (i.e., our metadata happened to be out of
 // date).
-func (b *Broker) muLeaderConnection(topic string, partition int32) (conn *connection, err error) {
+func (b *Broker) leaderConnection(
+	topic string, partition int32) (conn *connection, err error) {
+
 	tp := topicPartition{topic, partition}
-
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	for retry := 0; retry < b.conf.LeaderRetryLimit; retry++ {
-		if retry != 0 {
-			b.mu.Unlock()
+	retry := &backoff.Backoff{Min: b.conf.LeaderRetryWait, Jitter: true}
+	for try := 0; try < b.conf.LeaderRetryLimit; try++ {
+		if try != 0 {
+			sleepFor := retry.Duration()
 			log.Debug("cannot get leader connection",
 				"topic", topic,
 				"partition", partition,
-				"retry", retry,
-				"sleep", b.conf.LeaderRetryWait.String())
-			time.Sleep(b.conf.LeaderRetryWait)
-			b.mu.Lock()
+				"retry", try,
+				"sleep", sleepFor)
+			time.Sleep(sleepFor)
 		}
 
-		nodeID, ok := b.metadata.endpoints[tp]
-		if !ok {
-			err = b.refreshMetadata()
+		// Attempt to learn where this topic/partition is. This may return an error in which
+		// case we don't know about it and should refresh metadata.
+		var nodeID int32
+		nodeID, err = b.metadata.GetEndpoint(tp)
+		if err != nil {
+			err = b.metadata.Refresh()
 			if err != nil {
 				log.Info("cannot get leader connection: cannot refresh metadata",
 					"error", err)
 				continue
 			}
-			nodeID, ok = b.metadata.endpoints[tp]
-			if !ok {
+			nodeID, err = b.metadata.GetEndpoint(tp)
+			if err != nil {
 				err = proto.ErrUnknownTopicOrPartition
 				// If we allow topic creation, now is the point where it is likely that this
 				// is a brand new topic, so try to get metadata on it (which will trigger
 				// the creation process)
 				if b.conf.AllowTopicCreation {
-					_, err := b.fetchMetadata(topic)
+					_, err := b.metadata.Fetch(topic)
 					if err != nil {
 						log.Info("failed to fetch metadata for new topic",
 							"topic", topic,
@@ -433,30 +308,36 @@ func (b *Broker) muLeaderConnection(topic string, partition int32) (conn *connec
 						"topic", topic,
 						"partition", partition,
 						"endpoint", tp)
+					// We've already refreshed the metadata. The topic doesn't exist and we're
+					// not in creation mode so let's return now so we don't spend all the retries
+					// refreshing a topic that doesn't exist.
+					break
 				}
 				continue
 			}
 		}
 
-		conn, ok = b.conns[nodeID]
-		if !ok {
-			addr, ok := b.metadata.nodes[nodeID]
-			if !ok {
-				log.Info("cannot get leader connection: no information about node",
-					"nodeID", nodeID)
-				err = proto.ErrBrokerNotAvailable
-				delete(b.metadata.endpoints, tp)
-				continue
-			}
-			conn, err = newTCPConnection(addr, b.conf.DialTimeout)
-			if err != nil {
-				log.Info("cannot get leader connection: cannot connect to node",
-					"address", addr,
-					"error", err)
-				delete(b.metadata.endpoints, tp)
-				continue
-			}
-			b.conns[nodeID] = conn
+		// Now attempt to get a connection to this node
+		addr := b.metadata.GetNodeAddress(nodeID)
+		if addr == "" {
+			log.Info("cannot get leader connection: no information about node",
+				"nodeID", nodeID)
+			err = proto.ErrBrokerNotAvailable
+			// Forget the endpoint so we'll refresh metadata after the next retry.
+			b.metadata.ForgetEndpoint(tp)
+			continue
+		}
+
+		conn, err = b.conns.GetConnectionByAddr(addr)
+		if err != nil {
+			log.Info("cannot get leader connection: cannot connect to node",
+				"address", addr,
+				"error", err)
+			// Forget the endpoint. It's possible this broker has failed and we want to wait
+			// for Kafka to elect a new leader. To trick our algorithm into working we have to
+			// forget this endpoint so it will refresh metadata.
+			b.metadata.ForgetEndpoint(tp)
+			continue
 		}
 		return conn, nil
 	}
@@ -466,82 +347,34 @@ func (b *Broker) muLeaderConnection(topic string, partition int32) (conn *connec
 // coordinatorConnection returns connection to offset coordinator for given group.
 //
 // Failed connection retry is controlled by broker configuration.
-func (b *Broker) muCoordinatorConnection(consumerGroup string) (conn *connection, resErr error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	for retry := 0; retry < b.conf.LeaderRetryLimit; retry++ {
-		if retry != 0 {
-			b.mu.Unlock()
-			time.Sleep(b.conf.LeaderRetryWait)
-			b.mu.Lock()
+func (b *Broker) coordinatorConnection(consumerGroup string) (conn *connection, resErr error) {
+	addrs := b.conns.GetAllAddrs()
+	retry := &backoff.Backoff{Min: b.conf.LeaderRetryWait, Jitter: true}
+	for try := 0; try < b.conf.LeaderRetryLimit; try++ {
+		if try != 0 {
+			time.Sleep(retry.Duration())
 		}
 
-		// first try all already existing connections
-		for _, conn := range b.conns {
+		// First try an idle connection
+		conn := b.conns.GetIdleConnection()
+		if conn == nil {
+			for _, idx := range rndPerm(len(addrs)) {
+				var err error
+				conn, err = b.conns.GetConnectionByAddr(addrs[idx])
+				if err == nil {
+					// No error == have a nice connection.
+					break
+				}
+			}
+		}
+
+		if conn != nil {
 			resp, err := conn.ConsumerMetadata(&proto.ConsumerMetadataReq{
 				ClientID:      b.conf.ClientID,
 				ConsumerGroup: consumerGroup,
 			})
 			if err != nil {
-				log.Debug("cannot fetch coordinator metadata",
-					"consumGrp", consumerGroup,
-					"error", err)
-				resErr = err
-				continue
-			}
-			if resp.Err != nil {
-				log.Debug("coordinator metadata response error",
-					"consumGrp", consumerGroup,
-					"error", resp.Err)
-				resErr = err
-				continue
-			}
-
-			addr := fmt.Sprintf("%s:%d", resp.CoordinatorHost, resp.CoordinatorPort)
-			conn, err := newTCPConnection(addr, b.conf.DialTimeout)
-			if err != nil {
-				log.Debug("cannot connect to node",
-					"coordinatorID", resp.CoordinatorID,
-					"address", addr,
-					"error", err)
-				resErr = err
-				continue
-			}
-			b.conns[resp.CoordinatorID] = conn
-			return conn, nil
-		}
-
-		// if none of the connections worked out, try with fresh data
-		if err := b.refreshMetadata(); err != nil {
-			log.Debug("cannot refresh metadata",
-				"error", err)
-			resErr = err
-			continue
-		}
-
-		for nodeID, addr := range b.metadata.nodes {
-			if _, ok := b.conns[nodeID]; ok {
-				// connection to node is cached so it was already checked
-				continue
-			}
-			conn, err := newTCPConnection(addr, b.conf.DialTimeout)
-			if err != nil {
-				log.Debug("cannot connect to node",
-					"nodeID", nodeID,
-					"address", addr,
-					"error", err)
-				resErr = err
-				continue
-			}
-			b.conns[nodeID] = conn
-
-			resp, err := conn.ConsumerMetadata(&proto.ConsumerMetadataReq{
-				ClientID:      b.conf.ClientID,
-				ConsumerGroup: consumerGroup,
-			})
-			if err != nil {
-				log.Debug("cannot fetch metadata",
+				log.Debug("cannot fetch consumer metadata",
 					"consumGrp", consumerGroup,
 					"error", err)
 				resErr = err
@@ -551,59 +384,47 @@ func (b *Broker) muCoordinatorConnection(consumerGroup string) (conn *connection
 				log.Debug("metadata response error",
 					"consumGrp", consumerGroup,
 					"error", resp.Err)
-				resErr = err
+				resErr = resp.Err
 				continue
 			}
 
 			addr := fmt.Sprintf("%s:%d", resp.CoordinatorHost, resp.CoordinatorPort)
-			conn, err = newTCPConnection(addr, b.conf.DialTimeout)
+			conn, err = b.conns.GetConnectionByAddr(addr)
 			if err != nil {
-				log.Debug("cannot connect to node",
+				log.Debug("cannot connect to coordinator node",
 					"coordinatorID", resp.CoordinatorID,
 					"address", addr,
 					"error", err)
 				resErr = err
 				continue
 			}
-			b.conns[resp.CoordinatorID] = conn
 			return conn, nil
 		}
+
+		// Current error state
 		resErr = proto.ErrNoCoordinator
-	}
-	return nil, resErr
-}
 
-// muCloseDeadConnection is closing and removing any reference to given
-// connection. Because we remove dead connection, additional request to refresh
-// metadata is made
-//
-// muCloseDeadConnection call it protected with broker's lock.
-func (b *Broker) muCloseDeadConnection(conn *connection) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	for nid, c := range b.conns {
-		if c == conn {
-			log.Debug("closing dead connection",
-				"nodeID", nid)
-			delete(b.conns, nid)
-			_ = c.Close()
-			if err := b.refreshMetadata(); err != nil {
-				log.Debug("cannot refresh metadata",
-					"error", err)
-			}
-			return
+		// Refresh metadata. At this point it looks like none of the connections worked, so
+		// possibly we need a new set.
+		if err := b.metadata.Refresh(); err != nil {
+			log.Debug("cannot refresh metadata",
+				"error", err)
+			resErr = err
+			continue
 		}
 	}
+	return nil, resErr
 }
 
 // offset will return offset value for given partition. Use timems to specify
 // which offset value should be returned.
 func (b *Broker) offset(topic string, partition int32, timems int64) (offset int64, err error) {
-	conn, err := b.muLeaderConnection(topic, partition)
+	conn, err := b.leaderConnection(topic, partition)
 	if err != nil {
 		return 0, err
 	}
+	defer func() { go b.conns.Idle(conn) }()
+
 	resp, err := conn.Offset(&proto.OffsetReq{
 		ClientID:  b.conf.ClientID,
 		ReplicaID: -1, // any client
@@ -620,6 +441,7 @@ func (b *Broker) offset(topic string, partition int32, timems int64) (offset int
 			},
 		},
 	})
+
 	if err != nil {
 		if _, ok := err.(*net.OpError); ok || err == io.EOF || err == syscall.EPIPE {
 			// Connection is broken, so should be closed, but the error is
@@ -629,7 +451,7 @@ func (b *Broker) offset(topic string, partition int32, timems int64) (offset int
 				"topic", topic,
 				"partition", partition,
 				"error", err)
-			b.muCloseDeadConnection(conn)
+			conn.Close()
 		}
 		return 0, err
 	}
@@ -694,8 +516,10 @@ type ProducerConf struct {
 	// set to 10.
 	RetryLimit int
 
-	// RetryWait specify wait duration before produce retry after failure. By
-	// default set to 200ms.
+	// RetryWait specify wait duration before produce retry after failure. This
+	// is subject to exponential backoff.
+	//
+	// Defaults to 200ms.
 	RetryWait time.Duration
 }
 
@@ -731,12 +555,14 @@ func (b *Broker) Producer(conf ProducerConf) Producer {
 // RetryLimit and RetryWait attributes.
 //
 // Upon a successful call, the message's Offset field is updated.
-func (p *producer) Produce(topic string, partition int32, messages ...*proto.Message) (offset int64, err error) {
+func (p *producer) Produce(
+	topic string, partition int32, messages ...*proto.Message) (offset int64, err error) {
 
+	retry := &backoff.Backoff{Min: p.conf.RetryWait, Jitter: true}
 retryLoop:
-	for retry := 0; retry < p.conf.RetryLimit; retry++ {
-		if retry != 0 {
-			time.Sleep(p.conf.RetryWait)
+	for try := 0; try < p.conf.RetryLimit; try++ {
+		if try != 0 {
+			time.Sleep(retry.Duration())
 		}
 
 		offset, err = p.produce(topic, partition, messages...)
@@ -751,7 +577,7 @@ retryLoop:
 			// we cannot handle this error here, because there is no direct
 			// access to connection
 		default:
-			if err := p.broker.muRefreshMetadata(); err != nil {
+			if err := p.broker.metadata.Refresh(); err != nil {
 				log.Debug("cannot refresh metadata",
 					"error", err)
 			}
@@ -772,11 +598,14 @@ retryLoop:
 }
 
 // produce send produce request to leader for given destination.
-func (p *producer) produce(topic string, partition int32, messages ...*proto.Message) (offset int64, err error) {
-	conn, err := p.broker.muLeaderConnection(topic, partition)
+func (p *producer) produce(
+	topic string, partition int32, messages ...*proto.Message) (offset int64, err error) {
+
+	conn, err := p.broker.leaderConnection(topic, partition)
 	if err != nil {
 		return 0, err
 	}
+	defer func() { go p.broker.conns.Idle(conn) }()
 
 	req := proto.ProduceReq{
 		ClientID:     p.broker.conf.ClientID,
@@ -806,7 +635,7 @@ func (p *producer) produce(topic string, partition int32, messages ...*proto.Mes
 				"topic", topic,
 				"partition", partition,
 				"error", err)
-			p.broker.muCloseDeadConnection(conn)
+			conn.Close()
 		}
 		return 0, err
 	}
@@ -864,7 +693,8 @@ type ConsumerConf struct {
 	RetryLimit int
 
 	// RetryWait controls the duration of wait between fetch request calls,
-	// when no data was returned.
+	// when no data was returned. This follows an exponential backoff model
+	// so that we don't overload servers that have very little data.
 	//
 	// Default is 50ms.
 	RetryWait time.Duration
@@ -876,7 +706,7 @@ type ConsumerConf struct {
 	RetryErrLimit int
 
 	// RetryErrWait controls the wait duration between retries after failed
-	// fetch request.
+	// fetch request. This follows the exponential backoff curve.
 	//
 	// Default is 500ms.
 	RetryErrWait time.Duration
@@ -923,9 +753,9 @@ type consumer struct {
 	broker *Broker
 	conf   ConsumerConf
 
-	mu     sync.Mutex
+	// mu protects the following and must not be used outside of consumer.
+	mu     *sync.Mutex
 	offset int64 // offset of next NOT consumed message
-	conn   *connection
 	msgbuf []*proto.Message
 }
 
@@ -940,10 +770,6 @@ func (b *Broker) BatchConsumer(conf ConsumerConf) (BatchConsumer, error) {
 }
 
 func (b *Broker) consumer(conf ConsumerConf) (*consumer, error) {
-	conn, err := b.muLeaderConnection(conf.Topic, conf.Partition)
-	if err != nil {
-		return nil, err
-	}
 	offset := conf.StartOffset
 	if offset < 0 {
 		switch offset {
@@ -965,7 +791,7 @@ func (b *Broker) consumer(conf ConsumerConf) (*consumer, error) {
 	}
 	c := &consumer{
 		broker: b,
-		conn:   conn,
+		mu:     &sync.Mutex{},
 		conf:   conf,
 		msgbuf: make([]*proto.Message, 0),
 		offset: offset,
@@ -1058,31 +884,28 @@ func (c *consumer) fetch() ([]*proto.Message, error) {
 	}
 
 	var resErr error
+	retry := &backoff.Backoff{Min: c.conf.RetryErrWait, Jitter: true}
 consumeRetryLoop:
-	for retry := 0; retry < c.conf.RetryErrLimit; retry++ {
-		if retry != 0 {
-			time.Sleep(c.conf.RetryErrWait)
+	for try := 0; try < c.conf.RetryErrLimit; try++ {
+		if try != 0 {
+			time.Sleep(retry.Duration())
 		}
 
-		if c.conn == nil {
-			conn, err := c.broker.muLeaderConnection(c.conf.Topic, c.conf.Partition)
-			if err != nil {
-				resErr = err
-				continue
-			}
-			c.conn = conn
+		conn, err := c.broker.leaderConnection(c.conf.Topic, c.conf.Partition)
+		if err != nil {
+			resErr = err
+			continue
 		}
+		defer func() { go c.broker.conns.Idle(conn) }()
 
-		resp, err := c.conn.Fetch(&req)
+		resp, err := conn.Fetch(&req)
 		resErr = err
-
 		if _, ok := err.(*net.OpError); ok || err == io.EOF || err == syscall.EPIPE {
 			log.Debug("connection died while fetching message",
 				"topic", c.conf.Topic,
 				"partition", c.conf.Partition,
 				"error", err)
-			c.broker.muCloseDeadConnection(c.conn)
-			c.conn = nil
+			conn.Close()
 			continue
 		}
 
@@ -1090,8 +913,7 @@ consumeRetryLoop:
 			log.Debug("cannot fetch messages: unknown error",
 				"retry", retry,
 				"error", err)
-			c.broker.muCloseDeadConnection(c.conn)
-			c.conn = nil
+			conn.Close()
 			continue
 		}
 
@@ -1112,18 +934,15 @@ consumeRetryLoop:
 				}
 				switch part.Err {
 				case proto.ErrLeaderNotAvailable, proto.ErrNotLeaderForPartition, proto.ErrBrokerNotAvailable:
+					// Failover happened, so we probably need to talk to a different broker. Let's
+					// kick off a metadata refresh.
 					log.Debug("cannot fetch messages",
 						"retry", retry,
 						"error", part.Err)
-					if err := c.broker.muRefreshMetadata(); err != nil {
+					if err := c.broker.metadata.Refresh(); err != nil {
 						log.Debug("cannot refresh metadata",
 							"error", err)
 					}
-					// The connection is fine, so don't close it,
-					// but we may very well need to talk to a different broker now.
-					// Set the conn to nil so that next time around the loop
-					// we'll check the metadata again to see who we're supposed to talk to.
-					c.conn = nil
 					continue consumeRetryLoop
 				}
 				return part.Messages, part.Err
@@ -1159,19 +978,20 @@ type offsetCoordinator struct {
 	conf   OffsetCoordinatorConf
 	broker *Broker
 
-	mu   sync.Mutex
+	mu   *sync.Mutex
 	conn *connection
 }
 
 // OffsetCoordinator returns offset management coordinator for single consumer
 // group, bound to broker.
 func (b *Broker) OffsetCoordinator(conf OffsetCoordinatorConf) (OffsetCoordinator, error) {
-	conn, err := b.muCoordinatorConnection(conf.ConsumerGroup)
+	conn, err := b.coordinatorConnection(conf.ConsumerGroup)
 	if err != nil {
 		return nil, err
 	}
 	c := &offsetCoordinator{
 		broker: b,
+		mu:     &sync.Mutex{},
 		conf:   conf,
 		conn:   conn,
 	}
@@ -1193,33 +1013,53 @@ func (c *offsetCoordinator) CommitFull(topic string, partition int32, offset int
 	return c.commit(topic, partition, offset, metadata)
 }
 
-// commit is saving offset and metadata information. Provides limited error
-// handling configurable through OffsetCoordinatorConf.
-func (c *offsetCoordinator) commit(topic string, partition int32, offset int64, metadata string) (resErr error) {
+// getConnection returns a copy of the connection. This takes the lock so that we
+// ensure we get a consistent copy.
+func (c *offsetCoordinator) getConnection() (*connection, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	for retry := 0; retry < c.conf.RetryErrLimit; retry++ {
-		if retry != 0 {
-			c.mu.Unlock()
-			time.Sleep(c.conf.RetryErrWait)
-			c.mu.Lock()
+	// Only return the connection if it's still open. It can have closed for some reason
+	// by someone else.
+	if c.conn != nil && !c.conn.IsClosed() {
+		return c.conn, nil
+	}
+
+	// connection can be set to nil if previously reference connection died. We do this in
+	// the lock because otherwise everybody might rush to create new connections and then
+	// overwrite each other. This lock is scoped small enough that we're OK waiting for the
+	// network operation within the lock.
+	conn, err := c.broker.coordinatorConnection(c.conf.ConsumerGroup)
+	if err != nil {
+		log.Debug("cannot connect to coordinator",
+			"consumGrp", c.conf.ConsumerGroup,
+			"error", err)
+		return nil, err
+	}
+	c.conn = conn
+	return c.conn, nil
+}
+
+// commit is saving offset and metadata information. Provides limited error
+// handling configurable through OffsetCoordinatorConf.
+func (c *offsetCoordinator) commit(
+	topic string, partition int32, offset int64, metadata string) (resErr error) {
+
+	retry := &backoff.Backoff{Min: c.conf.RetryErrWait, Jitter: true}
+	for try := 0; try < c.conf.RetryErrLimit; try++ {
+		if try != 0 {
+			time.Sleep(retry.Duration())
 		}
 
-		// connection can be set to nil if previously reference connection died
-		if c.conn == nil {
-			conn, err := c.broker.muCoordinatorConnection(c.conf.ConsumerGroup)
-			if err != nil {
-				resErr = err
-				log.Debug("cannot connect to coordinator",
-					"consumGrp", c.conf.ConsumerGroup,
-					"error", err)
-				continue
-			}
-			c.conn = conn
+		// get a copy of our connection with the lock, this might establish a new
+		// connection so can take a bit
+		conn, err := c.getConnection()
+		if conn == nil {
+			resErr = err
+			continue
 		}
 
-		resp, err := c.conn.OffsetCommit(&proto.OffsetCommitReq{
+		resp, err := conn.OffsetCommit(&proto.OffsetCommitReq{
 			ClientID:      c.broker.conf.ClientID,
 			ConsumerGroup: c.conf.ConsumerGroup,
 			Topics: []proto.OffsetCommitReqTopic{
@@ -1234,12 +1074,12 @@ func (c *offsetCoordinator) commit(topic string, partition int32, offset int64, 
 		resErr = err
 
 		if _, ok := err.(*net.OpError); ok || err == io.EOF || err == syscall.EPIPE {
-			log.Debug("connection died while commiting",
+			log.Debug("connection died while committing",
 				"topic", topic,
 				"partition", partition,
 				"consumGrp", c.conf.ConsumerGroup)
-			c.broker.muCloseDeadConnection(c.conn)
-			c.conn = nil
+			conn.Close()
+
 		} else if err == nil {
 			for _, t := range resp.Topics {
 				if t.Name != topic {
@@ -1268,33 +1108,26 @@ func (c *offsetCoordinator) commit(topic string, partition int32, offset int64, 
 
 // Offset is returning last offset and metadata information committed for given
 // topic and partition.
+//
 // Offset can retry sending request on common errors. This behaviour can be
 // configured with with RetryErrLimit and RetryErrWait coordinator
 // configuration attributes.
 func (c *offsetCoordinator) Offset(topic string, partition int32) (offset int64, metadata string, resErr error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	for retry := 0; retry < c.conf.RetryErrLimit; retry++ {
-		if retry != 0 {
-			c.mu.Unlock()
-			time.Sleep(c.conf.RetryErrWait)
-			c.mu.Lock()
+	retry := &backoff.Backoff{Min: c.conf.RetryErrWait, Jitter: true}
+	for try := 0; try < c.conf.RetryErrLimit; try++ {
+		if try != 0 {
+			time.Sleep(retry.Duration())
 		}
 
-		// connection can be set to nil if previously reference connection died
-		if c.conn == nil {
-			conn, err := c.broker.muCoordinatorConnection(c.conf.ConsumerGroup)
-			if err != nil {
-				log.Debug("cannot connect to coordinator",
-					"consumGrp", c.conf.ConsumerGroup,
-					"error", err)
-				resErr = err
-				continue
-			}
-			c.conn = conn
+		// get a copy of our connection with the lock, this might establish a new
+		// connection so can take a bit
+		conn, err := c.getConnection()
+		if conn == nil {
+			resErr = err
+			continue
 		}
-		resp, err := c.conn.OffsetFetch(&proto.OffsetFetchReq{
+
+		resp, err := conn.OffsetFetch(&proto.OffsetFetchReq{
 			ConsumerGroup: c.conf.ConsumerGroup,
 			Topics: []proto.OffsetFetchReqTopic{
 				{
@@ -1311,8 +1144,8 @@ func (c *offsetCoordinator) Offset(topic string, partition int32) (offset int64,
 				"topic", topic,
 				"partition", partition,
 				"consumGrp", c.conf.ConsumerGroup)
-			c.broker.muCloseDeadConnection(c.conn)
-			c.conn = nil
+			conn.Close()
+
 		case nil:
 			for _, t := range resp.Topics {
 				if t.Name != topic {
@@ -1340,4 +1173,21 @@ func (c *offsetCoordinator) Offset(topic string, partition int32) (offset int64,
 	}
 
 	return 0, "", resErr
+}
+
+// rndIntn adds locking around accessing the random number generator. This is required because
+// Go doesn't provide locking within the rand.Rand object.
+func rndIntn(n int) int {
+	rndmu.Lock()
+	defer rndmu.Unlock()
+
+	return rnd.Intn(n)
+}
+
+// rndPerm adds locking around using the random number generator.
+func rndPerm(n int) []int {
+	rndmu.Lock()
+	defer rndmu.Unlock()
+
+	return rnd.Perm(n)
 }
