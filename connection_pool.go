@@ -29,8 +29,32 @@ func newConnectionPool(conf BrokerConf) *connectionPool {
 	}
 }
 
-// getAddrChan fetches a channel for a given address and, if one doesn't exist, creates it.
+// getAddrChan fetches a channel for a given address. This takes the read lock. If no
+// channel exists, nil is returned.
 func (cp *connectionPool) getAddrChan(addr string) chan *connection {
+	cp.mu.RLock()
+	defer cp.mu.RUnlock()
+
+	if cp.closed {
+		return nil
+	}
+
+	if _, ok := cp.chans[addr]; !ok {
+		return nil
+	}
+	return cp.chans[addr]
+}
+
+// getOrCreateAddrChan fetches a channel for a given address and, if one doesn't exist,
+// creates it. This function takes the write lock against the pool.
+func (cp *connectionPool) getOrCreateAddrChan(addr string) chan *connection {
+	// Fast path: only gets a read lock
+	chn := cp.getAddrChan(addr)
+	if chn != nil {
+		return chn
+	}
+
+	// Did not exist, take the slow path
 	cp.mu.Lock()
 	defer cp.mu.Unlock()
 
@@ -78,7 +102,7 @@ func (cp *connectionPool) GetIdleConnection() *connection {
 
 Address:
 	for _, idx := range rndPerm(len(addrs)) {
-		chn := cp.getAddrChan(addrs[idx])
+		chn := cp.getOrCreateAddrChan(addrs[idx])
 
 		for {
 			select {
@@ -101,11 +125,11 @@ Address:
 // We attempt to reuse connections if we can, but if a connection is not available within
 // IdleConnectionWait then we'll establish a new one.
 func (cp *connectionPool) GetConnectionByAddr(addr string) (*connection, error) {
-	chn := cp.getAddrChan(addr)
-	if chn == nil {
+	if cp.IsClosed() {
 		return nil, errors.New("connection pool is closed")
 	}
 
+	chn := cp.getOrCreateAddrChan(addr)
 	for {
 		select {
 		case conn := <-chn:
@@ -156,17 +180,23 @@ func (cp *connectionPool) IsClosed() bool {
 	return cp.closed
 }
 
-// Idle takes a now idle connection and makes it available for other users.
+// Idle takes a now idle connection and makes it available for other users. This should be
+// called in a goroutine so as not to block the original caller, as this function may take
+// some time to return.
 func (cp *connectionPool) Idle(conn *connection) {
+	// If the connection is closed, throw it away. But if the connection pool is closed, then
+	// close the connection.
 	if conn.IsClosed() {
+		return
+	} else if cp.IsClosed() {
+		conn.Close()
 		return
 	}
 
-	chn := cp.getAddrChan(conn.addr)
+	chn := cp.getOrCreateAddrChan(conn.addr)
 	select {
 	case chn <- conn:
-		// Do nothing, requeued.
-		//log.Debug("idle connection queued", "addr", conn.addr)
+		// Do nothing, connection was requeued.
 	case <-time.After(cp.conf.IdleConnectionWait):
 		// The queue is full for a while, discard this connection.
 		log.Debug("discarding idle connection", "addr", conn.addr)

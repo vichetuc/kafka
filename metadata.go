@@ -23,7 +23,7 @@ type clusterMetadata struct {
 }
 
 // cache creates new internal metadata representation using data from
-// given response. Its call has to be protected with lock.
+// given response.
 //
 // Do not call with partial metadata response, this assumes we have the full
 // set of metadata in the response!
@@ -81,8 +81,6 @@ func (cm *clusterMetadata) Refresh() error {
 // used to create a topic)
 func (cm *clusterMetadata) Fetch(topics ...string) (*proto.MetadataResp, error) {
 	// Get all addresses, then walk the array in permuted random order.
-	// TODO: There's an optimization to be made to reuse an already open and idle connection
-	// that I lost when I refactored. Might be worth readding.
 	addrs := cm.conns.GetAllAddrs()
 	log.Info("addrs", "addrs", addrs)
 	for _, idx := range rndPerm(len(addrs)) {
@@ -90,6 +88,7 @@ func (cm *clusterMetadata) Fetch(topics ...string) (*proto.MetadataResp, error) 
 		if err != nil {
 			continue
 		}
+		defer func() { go cm.conns.Idle(conn) }()
 
 		resp, err := conn.Metadata(&proto.MetadataReq{
 			ClientID: cm.conf.ClientID,
@@ -102,7 +101,6 @@ func (cm *clusterMetadata) Fetch(topics ...string) (*proto.MetadataResp, error) 
 			conn.Close()
 			continue
 		}
-		cm.conns.Idle(conn)
 		return resp, nil
 	}
 
@@ -127,11 +125,10 @@ func (cm *clusterMetadata) GetEndpoint(tp topicPartition) (int32, error) {
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()
 
-	nodeID, ok := cm.endpoints[tp]
-	if !ok {
-		return 0, errors.New("topic/partition not found in metadata")
+	if nodeID, ok := cm.endpoints[tp]; ok {
+		return nodeID, nil
 	}
-	return nodeID, nil
+	return 0, errors.New("topic/partition not found in metadata")
 }
 
 // ForgetEndpoint is used to remove an endpoint that doesn't see to lead to
