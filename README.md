@@ -1,17 +1,18 @@
-[![Build Status](https://travis-ci.org/optiopay/kafka.svg?branch=master)](https://travis-ci.org/optiopay/kafka)
-[![GoDoc](https://godoc.org/github.com/optiopay/kafka?status.png)](https://godoc.org/github.com/optiopay/kafka)
+[![Build Status](https://travis-ci.org/dropbox/kafka.svg?branch=master)](https://travis-ci.org/dropbox/kafka)
+[![GoDoc](https://godoc.org/github.com/dropbox/kafka?status.png)](https://godoc.org/github.com/dropbox/kafka)
 
 # Kafka
 
 Kafka is Go client library for [Apache Kafka](https://kafka.apache.org/)
-server, released under [MIT license](LICENSE]).
+server, released under [MIT license](LICENSE]). Originally based on the great
+client from: https://github.com/optiopay/kafka
 
 Kafka provides minimal abstraction over wire protocol, support for transparent
 failover and easy to use blocking API.
 
 
-* [godoc](https://godoc.org/github.com/optiopay/kafka) generated documentation,
-* [code examples](https://godoc.org/github.com/optiopay/kafka#pkg-examples)
+* [godoc](https://godoc.org/github.com/dropbox/kafka) generated documentation,
+* [code examples](https://godoc.org/github.com/dropbox/kafka#pkg-examples)
 
 ## Example
 
@@ -28,8 +29,8 @@ import (
     "os"
     "strings"
 
-    "github.com/optiopay/kafka"
-    "github.com/optiopay/kafka/proto"
+    "github.com/dropbox/kafka"
+    "github.com/dropbox/kafka/proto"
 )
 
 const (

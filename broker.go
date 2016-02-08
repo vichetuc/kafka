@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/jpillora/backoff"
-	"github.com/optiopay/kafka/proto"
+	"github.com/dropbox/kafka/proto"
 )
 
 const (

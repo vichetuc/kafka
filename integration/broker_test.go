@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/optiopay/kafka"
-	"github.com/optiopay/kafka/proto"
+	"github.com/dropbox/kafka"
+	"github.com/dropbox/kafka/proto"
 )
 
 func TestProducerBrokenConnection(t *testing.T) {

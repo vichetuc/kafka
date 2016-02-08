@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/optiopay/kafka/proto"
+	"github.com/dropbox/kafka/proto"
 )
 
 type clusterMetadata struct {

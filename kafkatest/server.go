@@ -12,7 +12,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/optiopay/kafka/proto"
+	"github.com/dropbox/kafka/proto"
 )
 
 type topicOffset struct {
