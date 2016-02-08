@@ -6,8 +6,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/optiopay/kafka"
-	"github.com/optiopay/kafka/proto"
+	"github.com/dropbox/kafka"
+	"github.com/dropbox/kafka/proto"
 )
 
 var (

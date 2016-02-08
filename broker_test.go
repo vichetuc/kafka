@@ -9,7 +9,7 @@ import (
 
 	. "gopkg.in/check.v1"
 
-	"github.com/optiopay/kafka/proto"
+	"github.com/dropbox/kafka/proto"
 )
 
 var _ = Suite(&BrokerSuite{})
