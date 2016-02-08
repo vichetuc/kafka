@@ -22,8 +22,9 @@ func TestProducerBrokenConnection(t *testing.T) {
 		_ = cluster.Stop()
 	}()
 
+    kafka.SetLogger(&testLogger{t})
+
 	bconf := kafka.NewBrokerConf("producer-broken-connection")
-	bconf.Logger = &testLogger{t}
 	addrs, err := cluster.KafkaAddrs()
 	if err != nil {
 		t.Fatalf("cannot get kafka address: %s", err)
@@ -122,8 +123,9 @@ func TestConsumerBrokenConnection(t *testing.T) {
 		_ = cluster.Stop()
 	}()
 
+    kafka.SetLogger(&testLogger{t})
+
 	bconf := kafka.NewBrokerConf("producer-broken-connection")
-	bconf.Logger = &testLogger{t}
 	addrs, err := cluster.KafkaAddrs()
 	if err != nil {
 		t.Fatalf("cannot get kafka address: %s", err)
