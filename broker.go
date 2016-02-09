@@ -10,8 +10,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/jpillora/backoff"
 	"github.com/dropbox/kafka/proto"
+	"github.com/jpillora/backoff"
 )
 
 const (
@@ -252,6 +252,12 @@ func (b *Broker) Close() {
 func (b *Broker) Metadata() (*proto.MetadataResp, error) {
 	resp, err := b.metadata.Fetch()
 	return resp, err
+}
+
+// PartitionCount returns the count of partitions in a topic, or 0 and an error if the topic
+// does not exist.
+func (b *Broker) PartitionCount(topic string) (int32, error) {
+	return b.metadata.PartitionCount(topic)
 }
 
 // leaderConnection returns connection to leader for given partition. If
