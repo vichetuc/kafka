@@ -946,14 +946,31 @@ func (s *BrokerSuite) TestPartitionOffsetClosedConnection(c *C) {
 	c.Assert(handlerErr, IsNil)
 	c.Assert(err, IsNil)
 	c.Assert(offset, Equals, int64(123))
+	c.Assert(len(broker.conns.addrs), Equals, 2)
 
 	srv1.Close()
 
-	_, err = broker.offset("test", 1, -2)
-	c.Assert(handlerErr, IsNil)
-	c.Assert(err, NotNil)
+	// This test is fundamentally broken. The above calls conn.Close on the client,
+	// but then it's a race. If the kernel happens to pass around the RST/close
+	// quickly, then the connection pool will never return the dead connection.
+	// However, if things are slow, we will get a dead connection.
+	//
+	// So, we now test two possibilities: either we get a dead connection, and
+	// then subsequently it works, or we get a valid connection and it works the
+	// first time.
 
 	offset, err = broker.offset("test", 1, -2)
+	if err != nil {
+		// First request failed, validate it failed correctly.
+		c.Assert(offset, Equals, int64(0))
+		c.Assert(handlerErr, IsNil)
+		c.Assert(err, NotNil)
+
+		// Do second request, since first failed.
+		offset, err = broker.offset("test", 1, -2)
+	}
+
+	// Now validate either the second request or the successful first request.
 	c.Assert(handlerErr, IsNil)
 	c.Assert(err, IsNil)
 	c.Assert(offset, Equals, int64(234))
@@ -964,26 +981,27 @@ func (s *BrokerSuite) TestPartitionOffsetClosedConnection(c *C) {
 func (s *BrokerSuite) TestLeaderConnectionFailover(c *C) {
 	srv1 := NewServer()
 	srv1.Start()
-	defer srv1.Close()
 
 	srv2 := NewServer()
 	srv2.Start()
 	defer srv2.Close()
 
-	addresses := []string{srv1.Address()}
-
 	host1, port1 := srv1.HostPort()
 	host2, port2 := srv2.HostPort()
 
-	srv1.Handle(MetadataRequest, func(request Serializable) Serializable {
-		req := request.(*proto.MetadataReq)
-		return &proto.MetadataResp{
-			CorrelationID: req.CorrelationID,
+	resps := []*proto.MetadataResp{
+		&proto.MetadataResp{
+			CorrelationID: 0,
 			Brokers: []proto.MetadataRespBroker{
 				{
 					NodeID: 1,
 					Host:   host1,
 					Port:   int32(port1),
+				},
+				{
+					NodeID: 2,
+					Host:   host2,
+					Port:   int32(port2),
 				},
 			},
 			Topics: []proto.MetadataRespTopic{
@@ -999,14 +1017,43 @@ func (s *BrokerSuite) TestLeaderConnectionFailover(c *C) {
 					},
 				},
 			},
-		}
-	})
-
-	srv2.Handle(MetadataRequest, func(request Serializable) Serializable {
-		req := request.(*proto.MetadataReq)
-		return &proto.MetadataResp{
-			CorrelationID: req.CorrelationID,
+		},
+		&proto.MetadataResp{
+			CorrelationID: 0,
 			Brokers: []proto.MetadataRespBroker{
+				{
+					NodeID: 1,
+					Host:   host1,
+					Port:   int32(port1),
+				},
+				{
+					NodeID: 2,
+					Host:   host2,
+					Port:   int32(port2),
+				},
+			},
+			Topics: []proto.MetadataRespTopic{
+				{
+					Name: "test",
+					Partitions: []proto.MetadataRespPartition{
+						{
+							ID:       0,
+							Leader:   1,
+							Replicas: []int32{1},
+							Isrs:     []int32{1},
+						},
+					},
+				},
+			},
+		},
+		&proto.MetadataResp{
+			CorrelationID: 0,
+			Brokers: []proto.MetadataRespBroker{
+				{
+					NodeID: 1,
+					Host:   host1,
+					Port:   int32(port1),
+				},
 				{
 					NodeID: 2,
 					Host:   host2,
@@ -1026,15 +1073,26 @@ func (s *BrokerSuite) TestLeaderConnectionFailover(c *C) {
 					},
 				},
 			},
-		}
-	})
+		},
+	}
+	handler := func(request Serializable) Serializable {
+		req := request.(*proto.MetadataReq)
+		resp := resps[0]
+		resp.CorrelationID = req.CorrelationID
+		resps = resps[1:]
+		return resp
+	}
+
+	srv1.Handle(MetadataRequest, handler)
+	srv2.Handle(MetadataRequest, handler)
 
 	conf := s.newTestBrokerConf("tester")
-	conf.DialTimeout = time.Millisecond * 20
+	conf.DialTimeout = time.Millisecond * 50
 	conf.LeaderRetryWait = time.Millisecond
 	conf.LeaderRetryLimit = 3
 
-	broker, err := Dial(addresses, conf)
+	// Force connection to first broker to start with
+	broker, err := Dial([]string{srv1.Address()}, conf)
 	c.Assert(broker, NotNil)
 	c.Assert(err, IsNil)
 
@@ -1050,7 +1108,10 @@ func (s *BrokerSuite) TestLeaderConnectionFailover(c *C) {
 	c.Assert(ok, Equals, true)
 	c.Assert(nodeID, Equals, int32(1))
 
+	// This is again a racy condition. We need to give a little time for all
+	// of the connections to close.
 	srv1.Close()
+	time.Sleep(500 * time.Millisecond)
 
 	_, err = broker.leaderConnection("test", 0)
 	c.Assert(err, NotNil)

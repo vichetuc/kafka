@@ -140,12 +140,20 @@ type BrokerConf struct {
 	// Defaults to 500ms.
 	DialRetryWait time.Duration
 
+	// ConnectionLimit sets a limit on how many outstanding connections may exist to a
+	// single broker. This limit is for all connections in any state -- we will never use
+	// more than this many connections at a time. Setting this too low can limit your
+	// throughput, but setting it too high can cause problems for your cluster.
+	//
+	// Defaults to 10.
+	ConnectionLimit int
+
 	// IdleConnectionLimit sets a limit on how many currently idle connections can
 	// be open to each broker. Lowering this will reduce the number of unused connections
 	// to Kafka, but can result in extra latency during request spikes if connections
 	// are not available and have to be established.
 	//
-	// Defaults to 10.
+	// Defaults to 5.
 	IdleConnectionLimit int
 
 	// IdleConnectionWait sets a timeout on how long we should wait for a connection to
@@ -165,7 +173,8 @@ func NewBrokerConf(clientID string) BrokerConf {
 		AllowTopicCreation:  false,
 		LeaderRetryLimit:    10,
 		LeaderRetryWait:     500 * time.Millisecond,
-		IdleConnectionLimit: 10,
+		ConnectionLimit:     10,
+		IdleConnectionLimit: 5,
 		IdleConnectionWait:  200 * time.Millisecond,
 	}
 }
@@ -494,12 +503,12 @@ func (b *Broker) offset(topic string, partition int32, timems int64) (offset int
 }
 
 // OffsetEarliest returns the oldest offset available on the given partition.
-func (b *Broker) OffsetEarliest(topic string, partition int32) (offset int64, err error) {
+func (b *Broker) OffsetEarliest(topic string, partition int32) (int64, error) {
 	return b.offset(topic, partition, -2)
 }
 
 // OffsetLatest return the offset of the next message produced in given partition
-func (b *Broker) OffsetLatest(topic string, partition int32) (offset int64, err error) {
+func (b *Broker) OffsetLatest(topic string, partition int32) (int64, error) {
 	return b.offset(topic, partition, -1)
 }
 
