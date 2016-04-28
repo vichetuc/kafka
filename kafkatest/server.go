@@ -200,7 +200,7 @@ func (s *Server) MustSpawn() {
 		return
 	}
 
-	ln, err := net.Listen("tcp4", "localhost:0")
+	ln, err := net.Listen("tcp4", ":0")
 	if err != nil {
 		panic(fmt.Sprintf("cannot listen: %s", err))
 	}

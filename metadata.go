@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dropbox/kafka/proto"
@@ -16,6 +17,9 @@ type clusterMetadata struct {
 	// mu protects the contents of this structure, but should only be gotten/used
 	// by the clusterMetadata methods.
 	mu         *sync.RWMutex
+	refLock    *sync.Mutex
+	epoch      *int64
+	timeout    time.Duration
 	created    time.Time
 	nodes      nodeMap                  // node ID to address
 	endpoints  map[topicPartition]int32 // partition to leader node ID
@@ -62,14 +66,48 @@ func (cm *clusterMetadata) cache(resp *proto.MetadataResp) {
 }
 
 // Refresh is requesting metadata information from any node and refresh
-// internal cached representation.
+// internal cached representation. This method can block for a long time depending
+// on how long it takes to update metadata.
 func (cm *clusterMetadata) Refresh() error {
-	log.Info("refreshing metadata")
-	meta, err := cm.Fetch()
-	if err == nil {
-		cm.cache(meta)
+	updateChan := make(chan error, 1)
+
+	go func() {
+		// The goal of this code is to ensure that only one person refreshes the metadata at a time
+		// and that everybody waiting for metadata can return whenever it's updated. The epoch
+		// counter is updated every time we get new metadata.
+		ctr1 := atomic.LoadInt64(cm.epoch)
+		cm.refLock.Lock()
+		defer cm.refLock.Unlock()
+
+		ctr2 := atomic.LoadInt64(cm.epoch)
+		if ctr2 > ctr1 {
+			// This happens when someone else has already updated the metadata by the time
+			// we have gotten the lock.
+			updateChan <- nil
+			return
+		}
+
+		// The counter has not updated, so it's on us to update metadata.
+		log.Info("refreshing metadata")
+		if meta, err := cm.Fetch(); err == nil {
+			// Update metadata + update counter to be old value plus one.
+			cm.cache(meta)
+			atomic.StoreInt64(cm.epoch, ctr1+1)
+			updateChan <- nil
+		} else {
+			// An error, note we do not update the epoch. This means that the next person to
+			// get the lock will try again, but we definitely return an error for this
+			// particular caller.
+			updateChan <- err
+		}
+	}()
+
+	select {
+	case err := <-updateChan:
+		return err
+	case <-time.After(cm.getTimeout()):
+		return errors.New("timed out refreshing metadata")
 	}
-	return err
 }
 
 // Fetch is requesting metadata information from any node and return
@@ -159,4 +197,11 @@ func (cm *clusterMetadata) GetNodeAddress(nodeID int32) string {
 
 	addr, _ := cm.nodes[nodeID]
 	return addr
+}
+
+func (cm *clusterMetadata) getTimeout() time.Duration {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+
+	return cm.timeout
 }

@@ -140,6 +140,14 @@ type BrokerConf struct {
 	// Defaults to 500ms.
 	DialRetryWait time.Duration
 
+	// MetadataRefreshTimeout is the maximum time to wait for a metadata refresh. This
+	// is compounding with many of the retries -- various failures trigger a metadata
+	// refresh. This should be set fairly high, as large metadata objects or loaded
+	// clusters can take a little while to return data.
+	//
+	// Defaults to 30s.
+	MetadataRefreshTimeout time.Duration
+
 	// ConnectionLimit sets a limit on how many outstanding connections may exist to a
 	// single broker. This limit is for all connections in any state -- we will never use
 	// more than this many connections at a time. Setting this too low can limit your
@@ -166,16 +174,17 @@ type BrokerConf struct {
 
 func NewBrokerConf(clientID string) BrokerConf {
 	return BrokerConf{
-		ClientID:            clientID,
-		DialTimeout:         10 * time.Second,
-		DialRetryLimit:      10,
-		DialRetryWait:       500 * time.Millisecond,
-		AllowTopicCreation:  false,
-		LeaderRetryLimit:    10,
-		LeaderRetryWait:     500 * time.Millisecond,
-		ConnectionLimit:     10,
-		IdleConnectionLimit: 5,
-		IdleConnectionWait:  200 * time.Millisecond,
+		ClientID:               clientID,
+		DialTimeout:            10 * time.Second,
+		DialRetryLimit:         10,
+		DialRetryWait:          500 * time.Millisecond,
+		AllowTopicCreation:     false,
+		LeaderRetryLimit:       10,
+		LeaderRetryWait:        500 * time.Millisecond,
+		MetadataRefreshTimeout: 30 * time.Second,
+		ConnectionLimit:        10,
+		IdleConnectionLimit:    5,
+		IdleConnectionWait:     200 * time.Millisecond,
 	}
 }
 
@@ -210,9 +219,12 @@ func Dial(nodeAddresses []string, conf BrokerConf) (*Broker, error) {
 		conf:  conf,
 		conns: pool,
 		metadata: &clusterMetadata{
-			mu:    &sync.RWMutex{},
-			conf:  conf,
-			conns: pool,
+			mu:      &sync.RWMutex{},
+			timeout: conf.MetadataRefreshTimeout,
+			refLock: &sync.Mutex{},
+			epoch:   new(int64),
+			conf:    conf,
+			conns:   pool,
 		},
 	}
 
@@ -235,15 +247,22 @@ func Dial(nodeAddresses []string, conf BrokerConf) (*Broker, error) {
 			time.Sleep(sleepFor)
 		}
 
-		err := broker.metadata.Refresh()
-		if err != nil {
+		resultChan := make(chan error, 1)
+		go func() {
+			resultChan <- broker.metadata.Refresh()
+		}()
+
+		select {
+		case err := <-resultChan:
+			if err == nil {
+				// Metadata has been refreshed, so this broker is ready to go
+				return broker, nil
+			}
 			log.Error("cannot fetch metadata",
 				"error", err)
-			continue
+		case <-time.After(conf.DialTimeout):
+			log.Error("timeout fetching metadata")
 		}
-
-		// Metadata has been refreshed, so this broker is ready to go
-		return broker, nil
 	}
 	return nil, errors.New("cannot connect (exhausted retries)")
 }
