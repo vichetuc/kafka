@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -71,6 +72,7 @@ type MetadataTester struct {
 	port               int
 	topics             map[string]bool
 	allowCreate        bool
+	requestDelay       time.Duration
 	numGeneralFetches  int
 	numSpecificFetches int
 }
@@ -87,6 +89,10 @@ func NewMetadataHandler(srv *Server, allowCreate bool) *MetadataTester {
 	return tester
 }
 
+func (m *MetadataTester) SetRequestDelay(delay time.Duration) {
+	m.requestDelay = delay
+}
+
 func (m *MetadataTester) NumGeneralFetches() int {
 	return m.numGeneralFetches
 }
@@ -97,6 +103,8 @@ func (m *MetadataTester) NumSpecificFetches() int {
 
 func (m *MetadataTester) Handler() RequestHandler {
 	return func(request Serializable) Serializable {
+		time.Sleep(m.requestDelay)
+
 		req := request.(*proto.MetadataReq)
 
 		if len(req.Topics) == 0 {
@@ -325,6 +333,37 @@ func (s *BrokerSuite) TestProducerWithNoAck(c *C) {
 	c.Assert(createdMsgs, Equals, 2)
 
 	broker.Close()
+}
+
+func (s *BrokerSuite) TestMetadataRefreshSerialization(c *C) {
+	srv := NewServer()
+	srv.Start()
+	defer srv.Close()
+
+	mdh := NewMetadataHandler(srv, false)
+	mdh.SetRequestDelay(100 * time.Millisecond)
+	srv.Handle(MetadataRequest, mdh.Handler())
+
+	broker, err := Dial([]string{srv.Address()}, s.newTestBrokerConf("tester"))
+	c.Assert(err, IsNil)
+	defer broker.Close()
+
+	c.Assert(atomic.LoadInt64(broker.metadata.epoch), Equals, int64(1))
+	c.Assert(broker.metadata.Refresh(), IsNil)
+	c.Assert(atomic.LoadInt64(broker.metadata.epoch), Equals, int64(2))
+
+	// Now try two at once, assert only one increment
+	go broker.metadata.Refresh()
+	c.Assert(broker.metadata.Refresh(), IsNil)
+	c.Assert(atomic.LoadInt64(broker.metadata.epoch), Equals, int64(3))
+
+	// Now test that the timeout works
+	func() {
+		broker.metadata.mu.Lock()
+		defer broker.metadata.mu.Unlock()
+		broker.metadata.timeout = 1 * time.Millisecond
+	}()
+	c.Assert(broker.metadata.Refresh(), NotNil)
 }
 
 func (s *BrokerSuite) TestProduceWhileLeaderChange(c *C) {

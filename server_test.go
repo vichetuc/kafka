@@ -111,6 +111,9 @@ func (srv *Server) Close() {
 func (srv *Server) handleClient(c net.Conn) {
 	clientID := time.Now().UnixNano()
 	srv.mu.Lock()
+	if _, ok := srv.clients[clientID]; ok {
+		panic("Programmer error: Duplicate clientID generated.")
+	}
 	srv.clients[clientID] = c
 	srv.mu.Unlock()
 
@@ -165,9 +168,7 @@ func (srv *Server) handleClient(c net.Conn) {
 			if err != nil {
 				panic(fmt.Sprintf("cannot serialize %T: %s", response, err))
 			}
-			if _, err := c.Write(b); err != nil {
-				panic(fmt.Sprintf("cannot wirte to client: %s", err))
-			}
+			c.Write(b)
 		}
 	}
 }

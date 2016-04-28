@@ -1,14 +1,13 @@
 package kafka
 
 import (
-	"errors"
 	"fmt"
-	"hash/fnv"
-	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dropbox/kafka/proto"
+	"github.com/jpillora/backoff"
 )
 
 // DistributingProducer is the interface similar to Producer, but never require
@@ -21,126 +20,230 @@ type DistributingProducer interface {
 	Distribute(topic string, messages ...*proto.Message) (offset int64, err error)
 }
 
-type randomProducer struct {
-	rand       *rand.Rand
-	producer   Producer
-	partitions int32
+// PartitionCountSource lets a DistributingProducer determine how many
+// partitions exist for a particular topic. Broker fulfills this interface
+// but a cache could be used instead.
+type PartitionCountSource interface {
+	PartitionCount(topic string) (count int32, err error)
 }
 
-// NewRandomProducer wraps given producer and return DistributingProducer that
-// publish messages to kafka, randomly picking partition number from range
-// [0, numPartitions)
-func NewRandomProducer(p Producer, numPartitions int32) DistributingProducer {
-	return &randomProducer{
-		rand:       rand.New(rand.NewSource(time.Now().UnixNano())),
-		producer:   p,
-		partitions: numPartitions,
+// ErrorAverseRRProducerOpts controls the behavior of errorAverseRRProducer.
+// PartitionCountSource: required
+// Producer: required
+// ErrorAverseBackoff: optional. Controls how long we should wait after a
+// produce fails to a particular partition.
+// PartitionFetchTimeout: optional. Controls how long Distribute will wait
+// to get a partition in the case where they are all unavailable due to
+// error averse backoff.
+type errorAverseRRProducerConf struct {
+	PartitionCountSource  PartitionCountSource
+	Producer              Producer
+	ErrorAverseBackoff    *backoff.Backoff
+	PartitionFetchTimeout time.Duration
+}
+
+func NewErrorAverseRRProducerConf() *errorAverseRRProducerConf {
+	return &errorAverseRRProducerConf{
+		PartitionCountSource: nil,
+		Producer:             nil,
+		ErrorAverseBackoff: &backoff.Backoff{
+			Min:    time.Duration(10 * time.Second),
+			Max:    time.Duration(5 * time.Minute),
+			Factor: 2, // Avoids race condition, see https://github.com/jpillora/backoff/pull/5
+			Jitter: true,
+		},
+		PartitionFetchTimeout: time.Duration(10 * time.Second),
 	}
 }
 
-// Distribute write messages to given kafka topic, randomly destination choosing
-// partition. All messages written within single Produce call are atomically
-// written to the same destination.
-func (p *randomProducer) Distribute(topic string, messages ...*proto.Message) (offset int64, err error) {
-	// In the case there are no partitions, which may happen for new topics
-	// when AllowTopicCreation is passed, we will write to partition 0
-	// since rand.Intn panics with 0
-	part := 0
-	if p.partitions > 0 {
-		part = p.rand.Intn(int(p.partitions))
+// errorAverseRRProducer writes to a topic's partitions in order sequentially
+// (stateful round robin) but when a produce fails, that partition is set
+// aside temporarily using exponential backoff.
+type errorAverseRRProducer struct {
+	partitionCountSource PartitionCountSource
+	producer             Producer
+	partitionManager     *partitionManager
+}
+
+type NoPartitionsAvailable struct{}
+
+func (NoPartitionsAvailable) Error() string {
+	return "No partitions available within timeout."
+}
+
+func NewErrorAverseRRProducer(conf *errorAverseRRProducerConf) DistributingProducer {
+	return &errorAverseRRProducer{
+		partitionCountSource: conf.PartitionCountSource,
+		producer:             conf.Producer,
+		partitionManager: &partitionManager{
+			availablePartitions: make(map[string]chan *partitionData),
+			lock:                &sync.RWMutex{},
+			sharedRetry:         conf.ErrorAverseBackoff,
+			getTimeout:          conf.PartitionFetchTimeout,
+		}}
+}
+
+func (d *errorAverseRRProducer) Distribute(topic string, messages ...*proto.Message) (offset int64, err error) {
+	if count, err := d.partitionCountSource.PartitionCount(topic); err == nil {
+		d.partitionManager.SetPartitionCount(topic, count)
+	} else {
+		// This topic doesn't exist, so we pretend it has one partition for now.
+		d.partitionManager.SetPartitionCount(topic, 1)
 	}
-	return p.producer.Produce(topic, int32(part), messages...)
-}
 
-type roundRobinProducer struct {
-	producer   Producer
-	partitions int32
-	mu         sync.Mutex
-	next       int32
-}
-
-// NewRoundRobinProducer wraps given producer and return DistributingProducer
-// that publish messages to kafka, choosing destination partition from cycle
-// build from [0, numPartitions) range.
-func NewRoundRobinProducer(p Producer, numPartitions int32) DistributingProducer {
-	return &roundRobinProducer{
-		producer:   p,
-		partitions: numPartitions,
-		next:       0,
-	}
-}
-
-// Distribute write messages to given kafka topic, choosing next destination
-// partition from internal cycle. All messages written within single Produce
-// call are atomically written to the same destination.
-func (p *roundRobinProducer) Distribute(topic string, messages ...*proto.Message) (offset int64, err error) {
-	p.mu.Lock()
-	part := p.next
-	p.next++
-	if p.next >= p.partitions {
-		p.next = 0
-	}
-	p.mu.Unlock()
-
-	return p.producer.Produce(topic, int32(part), messages...)
-}
-
-type hashProducer struct {
-	producer   Producer
-	partitions int32
-}
-
-// NewHashProducer wraps given producer and return DistributingProducer that
-// publish messages to kafka, computing partition number from message key hash,
-// using fnv hash and [0, numPartitions) range.
-func NewHashProducer(p Producer, numPartitions int32) DistributingProducer {
-	return &hashProducer{
-		producer:   p,
-		partitions: numPartitions,
-	}
-}
-
-// Distribute write messages to given kafka topic, computing partition number from
-// the message key value. Message key must be not nil and all messages written
-// within single Produce call are atomically written to the same destination.
-//
-// All messages passed within single Produce call must hash to the same
-// destination, otherwise no message is written and error is returned.
-func (p *hashProducer) Distribute(topic string, messages ...*proto.Message) (offset int64, err error) {
-	if len(messages) == 0 {
-		return 0, errors.New("no messages")
-	}
-	part, err := messageHashPartition(messages[0].Key, p.partitions)
+	partitionData, err := d.partitionManager.GetPartition(topic)
 	if err != nil {
-		return 0, fmt.Errorf("cannot hash message: %s", err)
+		log.Error(err.Error())
+		return 0, &NoPartitionsAvailable{}
 	}
-	// make sure that all messages within single call are to the same destination
-	for i := 2; i < len(messages); i++ {
-		mp, err := messageHashPartition(messages[i].Key, p.partitions)
-		if err != nil {
-			return 0, fmt.Errorf("cannot hash message: %s", err)
-		}
-		if part != mp {
-			return 0, errors.New("cannot publish messages to different destinations")
-		}
+	// We are now obligated to call Success or Failure on partitionData.
+	if offset, err := d.producer.Produce(topic, partitionData.Partition, messages...); err != nil {
+		err = fmt.Errorf("Failed to produce [%s:%d]: %s", topic, partitionData.Partition, err)
+		log.Error(err.Error())
+		partitionData.Failure()
+		return 0, err
+	} else {
+		partitionData.Success()
+		return offset, nil
 	}
-
-	return p.producer.Produce(topic, part, messages...)
 }
 
-// messageHashPartition compute destination partition number for given key
-// value and total number of partitions.
-func messageHashPartition(key []byte, partitions int32) (int32, error) {
-	if key == nil {
-		return 0, errors.New("no key")
+// partitionData wraps a retry tracker and the partitionManager's chan for
+// a particular partition. We have a pointer to the chan instead of the
+// partitionManager because the partitionManager will throw away and rebuild
+// its availablePartitions chan whenever the partition count changes. This means
+// calls to stale partitionData objects will manipulate a defunct
+// availablePartitions chan, which is harmless.
+//
+// successiveFailures is meant to atomically track the most recent count of
+// calls to Failure without an intervening call to Success. The implementation
+// is somewhat racy because it does not use a mutex, which means that in the
+// worst case of a partition which is intermittently unavailable, we may
+// suspend the partition for more or less time than we would have in a fully
+// synchronized implementation. However, in the steady states of healthy
+// or fully down, this implementation is more performant.
+type partitionData struct {
+	Partition           int32
+	sharedRetry         *backoff.Backoff
+	successiveFailures  uint64
+	availablePartitions chan *partitionData
+	topic               string // Just for debugging
+}
+
+func (d *partitionData) Success() {
+	// This logging message is quite racy, but is still useful because it indicates
+	// a successful produce definitely happened in some sort of proximity to
+	// a failed produce.
+	if successiveFailures := atomic.LoadUint64(&d.successiveFailures); successiveFailures > 0 {
+		log.Info(fmt.Sprintf("Resetting partition successiveFailures for %d of %s, was %d",
+			d.Partition, d.topic, successiveFailures))
 	}
-	hasher := fnv.New32a()
-	if _, err := hasher.Write(key); err != nil {
-		return 0, fmt.Errorf("cannot hash key: %s", err)
+	atomic.StoreUint64(&d.successiveFailures, 0)
+}
+
+func (d *partitionData) Failure() {
+	atomic.AddUint64(&d.successiveFailures, 1)
+}
+
+// reEnqueue makes this partition available for another producer thread, either
+// immediately or after a sleep corresponding to the number of successiveFailures
+// seen.
+//
+// While the inner function is running/sleeping, there may be other produces
+// to this partition in flight, but no new producer threads can get this
+// partition out of GetPartition.
+func (d *partitionData) reEnqueue() {
+	go func() {
+		if successiveFailures := atomic.LoadUint64(&d.successiveFailures); successiveFailures > 0 {
+			// The interface to ForAttempt is that the first failure should be #0.
+			t := d.sharedRetry.ForAttempt(float64(successiveFailures - 1))
+			log.Warn(fmt.Sprintf("Suspending partition %d of %s for %s (%d)", d.Partition, d.topic, t, successiveFailures))
+			time.Sleep(t)
+			log.Warn(fmt.Sprintf("Re-enqueueing partition %d of %s after %s", d.Partition, d.topic, t))
+		}
+		select {
+		case d.availablePartitions <- d:
+		default:
+			log.Error(fmt.Sprintf("Programmer error in reEnqueue(%s, %d)! This should never happen.",
+				d.topic, d.Partition))
+		}
+	}()
+}
+
+// partitionManager wraps the current availablePartitions which it
+// rebuilds in response to changes in partition counts.
+// The partitionManager also keeps a single Backoff object for shared use
+// among all the partitionData objects that will exist.
+type partitionManager struct {
+	availablePartitions map[string]chan *partitionData
+	lock                *sync.RWMutex
+	sharedRetry         *backoff.Backoff
+	getTimeout          time.Duration
+}
+
+// GetPartitionCount returns the size of a topic's availablePartitions chan.
+func (p *partitionManager) GetPartitionCount(topic string) (int32, error) {
+	p.lock.RLock()
+	defer p.lock.RUnlock()
+
+	if availablePartitions, ok := p.availablePartitions[topic]; !ok {
+		return 0, fmt.Errorf("No such topic %s", topic)
+	} else {
+		return int32(cap(availablePartitions)), nil
 	}
-	sum := int32(hasher.Sum32())
-	if sum < 0 {
-		sum = -sum
+}
+
+// SetPartitionCount resets the partitionManager's state for the given topic
+// if the count has changed. Partitions currently in error-averse backoff
+// will immediately be available for writing again.
+func (p *partitionManager) SetPartitionCount(topic string, partitionCount int32) {
+	if count, err := p.GetPartitionCount(topic); err == nil && count == partitionCount {
+		return
 	}
-	return sum % partitions, nil
+
+	p.lock.Lock()
+	defer p.lock.Unlock()
+
+	if availablePartitions, ok := p.availablePartitions[topic]; ok && int32(cap(availablePartitions)) == partitionCount {
+		log.Error(fmt.Sprintf("partitionManager(%s) hit slow path on SetPartitionCount but "+
+			"there is now no work to do. Count %d", topic, partitionCount))
+		return
+	} else {
+		log.Info(fmt.Sprintf("partitionManager adjusting partition count for %s: %d -> %d",
+			topic, cap(availablePartitions), partitionCount))
+
+		availablePartitions = make(chan *partitionData, partitionCount)
+		for i := int32(0); i < partitionCount; i++ {
+			availablePartitions <- &partitionData{
+				Partition:           i,
+				sharedRetry:         p.sharedRetry,
+				availablePartitions: availablePartitions,
+				topic:               topic,
+			}
+		}
+		p.availablePartitions[topic] = availablePartitions
+	}
+}
+
+// GetPartition fetches the next available partitionData object for the
+// given topic. The caller must call Success or Failure on this partitionData.
+func (p *partitionManager) GetPartition(topic string) (*partitionData, error) {
+	p.lock.RLock()
+	defer p.lock.RUnlock()
+
+	if availablePartitions, ok := p.availablePartitions[topic]; !ok {
+		return nil, fmt.Errorf("No such topic %s", topic)
+	} else {
+		select {
+		case partitionData, ok := <-availablePartitions:
+			if !ok {
+				return nil, fmt.Errorf(fmt.Sprintf("Programmer error in GetPartition(%s)! "+
+					"This should never happen.", topic))
+			}
+			defer partitionData.reEnqueue()
+			return partitionData, nil
+		case <-time.After(p.getTimeout):
+			return nil, fmt.Errorf(fmt.Sprintf("Timeout waiting for partition for %s.", topic))
+		}
+	}
 }

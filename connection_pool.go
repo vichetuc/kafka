@@ -72,7 +72,6 @@ func (b *backend) GetConnection() *connection {
 func (b *backend) getNewConnection() (*connection, error) {
 	for {
 		if ctr := b.NumOpenConnections(); int(ctr) >= b.conf.ConnectionLimit {
-			log.Info("at connection limit", "addr", b.addr)
 			return nil, nil
 		} else {
 			// Now attempt to increment and swap to ensure we don't race.

@@ -1,8 +1,9 @@
 package kafka
 
 import (
-	"fmt"
+	"errors"
 	"sync"
+	"time"
 
 	. "gopkg.in/check.v1"
 
@@ -21,16 +22,29 @@ func (s *DistProducerSuite) SetUpTest(c *C) {
 
 type recordingProducer struct {
 	sync.Mutex
-	msgs []*proto.Message
+	msgs               []*proto.Message
+	disabledPartitions map[int32]struct{}
+	disabledWrites     int
 }
 
-func newRecordingProducer() *recordingProducer {
-	return &recordingProducer{msgs: make([]*proto.Message, 0)}
+func newRecordingProducer(disabledPartitions map[int32]struct{}) *recordingProducer {
+	return &recordingProducer{
+		msgs:               make([]*proto.Message, 0),
+		disabledPartitions: disabledPartitions,
+	}
 }
 
 func (p *recordingProducer) Produce(topic string, part int32, msgs ...*proto.Message) (int64, error) {
 	p.Lock()
 	defer p.Unlock()
+
+	// This is sort of horrible, but we are in a race with partitionData.reEnqueue
+	time.Sleep(100 * time.Millisecond)
+
+	if _, ok := p.disabledPartitions[part]; ok {
+		p.disabledWrites++
+		return 0, errors.New("Oh noes.")
+	}
 
 	offset := len(p.msgs)
 	p.msgs = append(p.msgs, msgs...)
@@ -42,9 +56,23 @@ func (p *recordingProducer) Produce(topic string, part int32, msgs ...*proto.Mes
 	return int64(len(p.msgs)), nil
 }
 
-func (s *DistProducerSuite) TestRoundRobinProducer(c *C) {
-	rec := newRecordingProducer()
-	p := NewRoundRobinProducer(rec, 3)
+type dummyPartitionCountSource struct {
+	impl func(string) (int32, error)
+}
+
+func (p *dummyPartitionCountSource) PartitionCount(topic string) (int32, error) {
+	return p.impl(topic)
+}
+
+func (s *DistProducerSuite) TestErrorAverseRRProducerBasics(c *C) {
+	rec := newRecordingProducer(nil)
+	conf := NewErrorAverseRRProducerConf()
+	conf.PartitionCountSource = &dummyPartitionCountSource{
+		impl: func(string) (int32, error) { return 3, nil },
+	}
+	conf.Producer = rec
+	conf.PartitionFetchTimeout = time.Second
+	p := NewErrorAverseRRProducer(conf)
 
 	data := [][][]byte{
 		{
@@ -62,6 +90,13 @@ func (s *DistProducerSuite) TestRoundRobinProducer(c *C) {
 		{
 			[]byte("d 1"),
 		},
+		{
+			[]byte("e 1"),
+			[]byte("e 2"),
+		},
+		{
+			[]byte("f 1"),
+		},
 	}
 
 	for i, values := range data {
@@ -74,57 +109,250 @@ func (s *DistProducerSuite) TestRoundRobinProducer(c *C) {
 		}
 	}
 
-	// a, [0, 1]
-	if rec.msgs[0].Partition != 0 || rec.msgs[1].Partition != 0 {
-		c.Fatalf("expected partition 0, got %d and %d", rec.msgs[0].Partition, rec.msgs[1].Partition)
+	expected := map[int]int32{
+		0: 0,
+		1: 0,
+		2: 1,
+		3: 2,
+		4: 2,
+		5: 2,
+		6: 0,
+		7: 1,
+		8: 1,
+		9: 2,
 	}
 
-	// b, [2]
-	if rec.msgs[2].Partition != 1 {
-		c.Fatalf("expected partition 1, got %d", rec.msgs[2].Partition)
+	for msgNum, partition := range expected {
+		if rec.msgs[msgNum].Partition != partition {
+			c.Errorf("Wrong partition number for message %d. Expected %d but got %d.", msgNum, partition, rec.msgs[msgNum].Partition)
+		}
 	}
-
-	// c, [3, 4, 5]
-	if rec.msgs[3].Partition != 2 || rec.msgs[4].Partition != 2 {
-		c.Fatalf("expected partition 2, got %d and %d", rec.msgs[3].Partition, rec.msgs[3].Partition)
-	}
-
-	// d, [6]
-	if rec.msgs[6].Partition != 0 {
-		c.Fatalf("expected partition 0, got %d", rec.msgs[6].Partition)
+	if rec.disabledWrites != 0 {
+		c.Errorf("Wrong number of disabledWrites. Expected % d but got %d", 0, rec.disabledWrites)
 	}
 }
 
-func (s *DistProducerSuite) TestHashProducer(c *C) {
-	const parts = 3
-	rec := newRecordingProducer()
-	p := NewHashProducer(rec, parts)
-
-	var keys [][]byte
-	for i := 0; i < 30; i++ {
-		keys = append(keys, []byte(fmt.Sprintf("key-%d", i)))
+func (s *DistProducerSuite) TestErrorAverseRRProducerDeadPartition(c *C) {
+	rec := newRecordingProducer(map[int32]struct{}{
+		1: struct{}{},
+	})
+	conf := NewErrorAverseRRProducerConf()
+	conf.PartitionCountSource = &dummyPartitionCountSource{
+		impl: func(string) (int32, error) { return 3, nil },
 	}
-	for i, key := range keys {
-		msg := &proto.Message{Key: key}
-		if _, err := p.Distribute("test-topic", msg); err != nil {
+	conf.Producer = rec
+	conf.PartitionFetchTimeout = time.Second
+	p := NewErrorAverseRRProducer(conf)
+
+	data := [][][]byte{
+		{
+			[]byte("a 1"),
+			[]byte("a 2"),
+		},
+		{
+			[]byte("b 1"),
+		},
+		{
+			[]byte("c 1"),
+			[]byte("c 2"),
+			[]byte("c 3"),
+		},
+		{
+			[]byte("d 1"),
+		},
+		{
+			[]byte("e 1"),
+			[]byte("e 2"),
+		},
+		{
+			[]byte("f 1"),
+		},
+	}
+
+	for i, values := range data {
+		msgs := make([]*proto.Message, 0)
+		for _, value := range values {
+			msgs = append(msgs, &proto.Message{Value: value})
+		}
+		if i == 1 || i == 3 {
+			if _, err := p.Distribute("test-topic", msgs...); err == nil {
+				c.Errorf("Should have failed to write message %d: %s", i, err)
+			}
+		}
+		if _, err := p.Distribute("test-topic", msgs...); err != nil {
 			c.Errorf("cannot distribute %d message: %s", i, err)
 		}
 	}
 
-	if len(rec.msgs) != len(keys) {
-		c.Fatalf("expected %d messages, got %d", len(keys), len(rec.msgs))
+	expected := map[int]int32{
+		0: 0,
+		1: 0,
+		2: 2,
+		3: 0,
+		4: 0,
+		5: 0,
+		6: 2,
+		7: 0,
+		8: 0,
+		9: 2,
 	}
 
-	for i, key := range keys {
-		want, err := messageHashPartition(key, parts)
-		if err != nil {
-			c.Errorf("cannot compute hash: %s", err)
-			continue
+	for msgNum, partition := range expected {
+		if rec.msgs[msgNum].Partition != partition {
+			c.Errorf("Wrong partition number for message %d. Expected %d but got %d.", msgNum, partition, rec.msgs[msgNum].Partition)
 		}
-		if got := rec.msgs[i].Partition; want != got {
-			c.Errorf("expected partition %d, got %d", want, got)
-		} else if got > parts-1 {
-			c.Errorf("number of partitions is %d, but message written to %d", parts, got)
+	}
+
+	if rec.disabledWrites != 2 {
+		c.Errorf("Wrong number of disabledWrites. Expected % d but got %d", 2, rec.disabledWrites)
+	}
+}
+
+func (s *DistProducerSuite) TestErrorAverseRRProducerDeadPartitions(c *C) {
+	rec := newRecordingProducer(map[int32]struct{}{
+		0: struct{}{},
+		2: struct{}{},
+	})
+	conf := NewErrorAverseRRProducerConf()
+	conf.PartitionCountSource = &dummyPartitionCountSource{
+		impl: func(string) (int32, error) { return 3, nil },
+	}
+	conf.Producer = rec
+	conf.PartitionFetchTimeout = time.Second
+	p := NewErrorAverseRRProducer(conf)
+
+	data := [][][]byte{
+		{
+			[]byte("a 1"),
+			[]byte("a 2"),
+		},
+		{
+			[]byte("b 1"),
+		},
+		{
+			[]byte("c 1"),
+			[]byte("c 2"),
+			[]byte("c 3"),
+		},
+		{
+			[]byte("d 1"),
+		},
+		{
+			[]byte("e 1"),
+			[]byte("e 2"),
+		},
+		{
+			[]byte("f 1"),
+		},
+	}
+
+	for i, values := range data {
+		msgs := make([]*proto.Message, 0)
+		for _, value := range values {
+			msgs = append(msgs, &proto.Message{Value: value})
 		}
+		if i == 0 || i == 2 {
+			if _, err := p.Distribute("test-topic", msgs...); err == nil {
+				c.Errorf("Should have failed to write message %d: %s", i, err)
+			}
+			if _, err := p.Distribute("test-topic", msgs...); err != nil {
+				c.Errorf("cannot distribute %d message: %s", i, err)
+			}
+		} else if i == 1 {
+			if _, err := p.Distribute("test-topic", msgs...); err == nil {
+				c.Errorf("Should have failed to write message %d: %s", i, err)
+			}
+			if _, err := p.Distribute("test-topic", msgs...); err == nil {
+				c.Errorf("Should have failed to write message %d: %s", i, err)
+			}
+			if _, err := p.Distribute("test-topic", msgs...); err != nil {
+				c.Errorf("cannot distribute %d message: %s", i, err)
+			}
+		} else {
+			if _, err := p.Distribute("test-topic", msgs...); err != nil {
+				c.Errorf("cannot distribute %d message: %s", i, err)
+			}
+		}
+	}
+
+	expected := map[int]int32{
+		0: 1,
+		1: 1,
+		2: 1,
+		3: 1,
+		4: 1,
+		5: 1,
+		6: 1,
+		7: 1,
+		8: 1,
+		9: 1,
+	}
+
+	for msgNum, partition := range expected {
+		if rec.msgs[msgNum].Partition != partition {
+			c.Errorf("Wrong partition number for message %d. Expected %d but got %d.", msgNum, partition, rec.msgs[msgNum].Partition)
+		}
+	}
+	if rec.disabledWrites != 4 {
+		c.Errorf("Wrong number of disabledWrites. Expected % d but got %d", 4, rec.disabledWrites)
+	}
+}
+
+func (s *DistProducerSuite) TestErrorAverseRRProducerAllDeadPartitions(c *C) {
+	rec := newRecordingProducer(map[int32]struct{}{
+		0: struct{}{},
+		1: struct{}{},
+		2: struct{}{},
+	})
+	conf := NewErrorAverseRRProducerConf()
+	conf.PartitionCountSource = &dummyPartitionCountSource{
+		impl: func(string) (int32, error) { return 3, nil },
+	}
+	conf.Producer = rec
+	conf.PartitionFetchTimeout = time.Second
+	p := NewErrorAverseRRProducer(conf)
+
+	data := [][][]byte{
+		{
+			[]byte("a 1"),
+			[]byte("a 2"),
+		},
+		{
+			[]byte("b 1"),
+		},
+		{
+			[]byte("c 1"),
+			[]byte("c 2"),
+			[]byte("c 3"),
+		},
+		{
+			[]byte("d 1"),
+		},
+		{
+			[]byte("e 1"),
+			[]byte("e 2"),
+		},
+		{
+			[]byte("f 1"),
+		},
+	}
+
+	for i, values := range data {
+		msgs := make([]*proto.Message, 0)
+		for _, value := range values {
+			msgs = append(msgs, &proto.Message{Value: value})
+		}
+		if _, err := p.Distribute("test-topic", msgs...); err == nil {
+			c.Errorf("Should have failed to write message %d: %s", i, err)
+		} else if _, ok := err.(*NoPartitionsAvailable); i == 6 != ok {
+			c.Errorf("Got the wrong error type for batch %d: %s", i, err)
+		}
+	}
+
+	if len(rec.msgs) > 0 {
+		c.Errorf("Should have failed to write all messages, but saw %v", rec.msgs)
+	}
+	if rec.disabledWrites != 6 {
+		c.Errorf("Wrong number of disabledWrites. Expected % d but got %d", 6, rec.disabledWrites)
 	}
 }
