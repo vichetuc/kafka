@@ -243,3 +243,8 @@ func (c *OffsetCoordinator) Offset(topic string, partition int32) (offset int64,
 	}
 	return off, "", nil
 }
+
+func (c *OffsetCoordinator) Close() {
+	// No-op
+	return
+}

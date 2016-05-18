@@ -82,6 +82,7 @@ type Producer interface {
 type OffsetCoordinator interface {
 	Commit(topic string, partition int32, offset int64) error
 	Offset(topic string, partition int32) (offset int64, metadata string, err error)
+	Close()
 }
 
 type topicPartition struct {
@@ -403,6 +404,7 @@ func (b *Broker) coordinatorConnection(consumerGroup string) (conn *connection, 
 		}
 
 		if conn != nil {
+			defer func() { go b.conns.Idle(conn) }()
 			resp, err := conn.ConsumerMetadata(&proto.ConsumerMetadataReq{
 				ClientID:      b.conf.ClientID,
 				ConsumerGroup: consumerGroup,
@@ -1207,6 +1209,19 @@ func (c *offsetCoordinator) Offset(topic string, partition int32) (offset int64,
 	}
 
 	return 0, "", resErr
+}
+
+// Close releases the underlying connection back to the broker pool. Calling
+// clients should assume the coordinator cannot be re-used once it has been
+// closed.
+func (c *offsetCoordinator) Close() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.conn != nil && !c.conn.IsClosed() {
+		go c.broker.conns.Idle(c.conn)
+		c.conn = nil
+	}
 }
 
 // rndIntn adds locking around accessing the random number generator. This is required because
