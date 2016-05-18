@@ -259,6 +259,18 @@ func (cp *connectionPool) Close() {
 	cp.mu.Lock()
 	defer cp.mu.Unlock()
 
+	for _, backend := range cp.backends {
+	Loop:
+		for {
+			select {
+			case conn := <-backend.channel:
+				defer conn.Close()
+			default:
+				break Loop
+			}
+		}
+	}
+
 	cp.closed = true
 }
 
