@@ -314,6 +314,10 @@ func (b *Broker) leaderConnection(
 			time.Sleep(sleepFor)
 		}
 
+		if b.IsClosed() {
+			return nil, errors.New("Broker was closed, giving up on leaderConnection.")
+		}
+
 		// Attempt to learn where this topic/partition is. This may return an error in which
 		// case we don't know about it and should refresh metadata.
 		var nodeID int32
@@ -833,6 +837,13 @@ func (b *Broker) consumer(conf ConsumerConf) (*consumer, error) {
 		offset: offset,
 	}
 	return c, nil
+}
+
+func (b *Broker) IsClosed() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.conns == nil || b.conns.IsClosed()
 }
 
 // consume is returning a batch of messages from consumed partition.
