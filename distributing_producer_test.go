@@ -356,3 +356,94 @@ func (s *DistProducerSuite) TestErrorAverseRRProducerAllDeadPartitions(c *C) {
 		c.Errorf("Wrong number of disabledWrites. Expected % d but got %d", 6, rec.disabledWrites)
 	}
 }
+
+func (s *DistProducerSuite) TestErrorAverseRRProducerIncreasePartitionCount(c *C) {
+	rec := newRecordingProducer(nil)
+	conf := NewErrorAverseRRProducerConf()
+	var numPartitions int32 = 3
+	conf.PartitionCountSource = &dummyPartitionCountSource{
+		impl: func(string) (int32, error) { return numPartitions, nil },
+	}
+	conf.Producer = rec
+	conf.PartitionFetchTimeout = time.Second
+	p := NewErrorAverseRRProducer(conf)
+
+	data := [][][]byte{
+		{
+			[]byte("a 1"),
+			[]byte("a 2"),
+		},
+		{
+			[]byte("b 1"),
+		},
+		{
+			[]byte("c 1"),
+			[]byte("c 2"),
+			[]byte("c 3"),
+		},
+		{
+			[]byte("d 1"),
+		},
+		{
+			[]byte("e 1"),
+			[]byte("e 2"),
+		},
+		{
+			[]byte("f 1"),
+		},
+	}
+
+	for i, values := range data {
+		msgs := make([]*proto.Message, 0)
+		for _, value := range values {
+			msgs = append(msgs, &proto.Message{Value: value})
+		}
+		if _, err := p.Distribute("test-topic", msgs...); err != nil {
+			c.Errorf("cannot distribute %d message: %s", i, err)
+		}
+	}
+
+	numPartitions = 5
+
+	for i, values := range data {
+		msgs := make([]*proto.Message, 0)
+		for _, value := range values {
+			msgs = append(msgs, &proto.Message{Value: value})
+		}
+		if _, err := p.Distribute("test-topic", msgs...); err != nil {
+			c.Errorf("cannot distribute %d message: %s", i, err)
+		}
+	}
+
+	expected := map[int]int32{
+		0:  0,
+		1:  0,
+		2:  1,
+		3:  2,
+		4:  2,
+		5:  2,
+		6:  0,
+		7:  1,
+		8:  1,
+		9:  2,
+		10: 0,
+		11: 0,
+		12: 1,
+		13: 2,
+		14: 2,
+		15: 2,
+		16: 3,
+		17: 4,
+		18: 4,
+		19: 0,
+	}
+
+	for msgNum, partition := range expected {
+		if rec.msgs[msgNum].Partition != partition {
+			c.Errorf("Wrong partition number for message %d. Expected %d but got %d.", msgNum, partition, rec.msgs[msgNum].Partition)
+		}
+	}
+	if rec.disabledWrites != 0 {
+		c.Errorf("Wrong number of disabledWrites. Expected % d but got %d", 0, rec.disabledWrites)
+	}
+}
