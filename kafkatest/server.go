@@ -28,6 +28,8 @@ type Server struct {
 	offsets     map[string]map[int32]map[string]*topicOffset
 	ln          net.Listener
 	middlewares []Middleware
+	started     bool
+	stopped     bool
 }
 
 // Middleware is function that is called for every incomming kafka message,
@@ -60,10 +62,17 @@ func NewServer(middlewares ...Middleware) *Server {
 func (s *Server) Addr() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+
+	if s.stopped {
+		panic("server stopped, no addr available")
+	} else if !s.started {
+		panic("server never started, no addr available")
+	}
+
 	if s.ln != nil {
 		return s.ln.Addr().String()
 	}
-	return ""
+	panic("server should be running but isn't, no addr available")
 }
 
 // Reset will clear out local messages and topics.
@@ -78,6 +87,9 @@ func (s *Server) Reset() {
 func (s *Server) Close() (err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	s.stopped = true
+
 	if s.ln != nil {
 		err = s.ln.Close()
 		s.ln = nil
@@ -205,6 +217,7 @@ func (s *Server) MustSpawn() {
 		panic(fmt.Sprintf("cannot listen: %s", err))
 	}
 	s.ln = ln
+	s.started = true
 
 	if host, port, err := net.SplitHostPort(ln.Addr().String()); err != nil {
 		panic(fmt.Sprintf("cannot extract host/port from %q: %s", ln.Addr(), err))
@@ -435,7 +448,9 @@ func (s *Server) handleOffsetRequest(nodeID int32, conn net.Conn, req *proto.Off
 	return resp
 }
 
-func (s *Server) handleConsumerMetadataRequest(nodeID int32, conn net.Conn, req *proto.ConsumerMetadataReq) response {
+func (s *Server) handleConsumerMetadataRequest(
+	nodeID int32, conn net.Conn, req *proto.ConsumerMetadataReq) response {
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
