@@ -104,7 +104,7 @@ func (s *DistProducerSuite) TestErrorAverseRRProducerBasics(c *C) {
 		for _, value := range values {
 			msgs = append(msgs, &proto.Message{Value: value})
 		}
-		if _, err := p.Distribute("test-topic", msgs...); err != nil {
+		if _, _, err := p.Distribute("test-topic", msgs...); err != nil {
 			c.Errorf("cannot distribute %d message: %s", i, err)
 		}
 	}
@@ -175,11 +175,11 @@ func (s *DistProducerSuite) TestErrorAverseRRProducerDeadPartition(c *C) {
 			msgs = append(msgs, &proto.Message{Value: value})
 		}
 		if i == 1 || i == 3 {
-			if _, err := p.Distribute("test-topic", msgs...); err == nil {
+			if _, _, err := p.Distribute("test-topic", msgs...); err == nil {
 				c.Errorf("Should have failed to write message %d: %s", i, err)
 			}
 		}
-		if _, err := p.Distribute("test-topic", msgs...); err != nil {
+		if _, _, err := p.Distribute("test-topic", msgs...); err != nil {
 			c.Errorf("cannot distribute %d message: %s", i, err)
 		}
 	}
@@ -252,24 +252,24 @@ func (s *DistProducerSuite) TestErrorAverseRRProducerDeadPartitions(c *C) {
 			msgs = append(msgs, &proto.Message{Value: value})
 		}
 		if i == 0 || i == 2 {
-			if _, err := p.Distribute("test-topic", msgs...); err == nil {
+			if _, _, err := p.Distribute("test-topic", msgs...); err == nil {
 				c.Errorf("Should have failed to write message %d: %s", i, err)
 			}
-			if _, err := p.Distribute("test-topic", msgs...); err != nil {
+			if _, _, err := p.Distribute("test-topic", msgs...); err != nil {
 				c.Errorf("cannot distribute %d message: %s", i, err)
 			}
 		} else if i == 1 {
-			if _, err := p.Distribute("test-topic", msgs...); err == nil {
+			if _, _, err := p.Distribute("test-topic", msgs...); err == nil {
 				c.Errorf("Should have failed to write message %d: %s", i, err)
 			}
-			if _, err := p.Distribute("test-topic", msgs...); err == nil {
+			if _, _, err := p.Distribute("test-topic", msgs...); err == nil {
 				c.Errorf("Should have failed to write message %d: %s", i, err)
 			}
-			if _, err := p.Distribute("test-topic", msgs...); err != nil {
+			if _, _, err := p.Distribute("test-topic", msgs...); err != nil {
 				c.Errorf("cannot distribute %d message: %s", i, err)
 			}
 		} else {
-			if _, err := p.Distribute("test-topic", msgs...); err != nil {
+			if _, _, err := p.Distribute("test-topic", msgs...); err != nil {
 				c.Errorf("cannot distribute %d message: %s", i, err)
 			}
 		}
@@ -342,7 +342,7 @@ func (s *DistProducerSuite) TestErrorAverseRRProducerAllDeadPartitions(c *C) {
 		for _, value := range values {
 			msgs = append(msgs, &proto.Message{Value: value})
 		}
-		if _, err := p.Distribute("test-topic", msgs...); err == nil {
+		if _, _, err := p.Distribute("test-topic", msgs...); err == nil {
 			c.Errorf("Should have failed to write message %d: %s", i, err)
 		} else if _, ok := err.(*NoPartitionsAvailable); i == 6 != ok {
 			c.Errorf("Got the wrong error type for batch %d: %s", i, err)
@@ -398,7 +398,7 @@ func (s *DistProducerSuite) TestErrorAverseRRProducerIncreasePartitionCount(c *C
 		for _, value := range values {
 			msgs = append(msgs, &proto.Message{Value: value})
 		}
-		if _, err := p.Distribute("test-topic", msgs...); err != nil {
+		if _, _, err := p.Distribute("test-topic", msgs...); err != nil {
 			c.Errorf("cannot distribute %d message: %s", i, err)
 		}
 	}
@@ -410,7 +410,7 @@ func (s *DistProducerSuite) TestErrorAverseRRProducerIncreasePartitionCount(c *C
 		for _, value := range values {
 			msgs = append(msgs, &proto.Message{Value: value})
 		}
-		if _, err := p.Distribute("test-topic", msgs...); err != nil {
+		if _, _, err := p.Distribute("test-topic", msgs...); err != nil {
 			c.Errorf("cannot distribute %d message: %s", i, err)
 		}
 	}

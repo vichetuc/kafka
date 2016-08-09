@@ -17,7 +17,7 @@ import (
 // partition, returning the post-commit offset and any error encountered. The
 // offset of each message is also updated accordingly.
 type DistributingProducer interface {
-	Distribute(topic string, messages ...*proto.Message) (offset int64, err error)
+	Distribute(topic string, messages ...*proto.Message) (partition int32, offset int64, err error)
 }
 
 // PartitionCountSource lets a DistributingProducer determine how many
@@ -83,7 +83,9 @@ func NewErrorAverseRRProducer(conf *errorAverseRRProducerConf) DistributingProdu
 		}}
 }
 
-func (d *errorAverseRRProducer) Distribute(topic string, messages ...*proto.Message) (offset int64, err error) {
+func (d *errorAverseRRProducer) Distribute(topic string, messages ...*proto.Message) (
+	partition int32, offset int64, err error) {
+
 	if count, err := d.partitionCountSource.PartitionCount(topic); err == nil {
 		d.partitionManager.SetPartitionCount(topic, count)
 	} else {
@@ -94,17 +96,17 @@ func (d *errorAverseRRProducer) Distribute(topic string, messages ...*proto.Mess
 	partitionData, err := d.partitionManager.GetPartition(topic)
 	if err != nil {
 		log.Error(err.Error())
-		return 0, &NoPartitionsAvailable{}
+		return 0, 0, &NoPartitionsAvailable{}
 	}
 	// We are now obligated to call Success or Failure on partitionData.
 	if offset, err := d.producer.Produce(topic, partitionData.Partition, messages...); err != nil {
 		err = fmt.Errorf("Failed to produce [%s:%d]: %s", topic, partitionData.Partition, err)
 		log.Error(err.Error())
 		partitionData.Failure()
-		return 0, err
+		return 0, 0, err
 	} else {
 		partitionData.Success()
-		return offset, nil
+		return partitionData.Partition, offset, nil
 	}
 }
 
