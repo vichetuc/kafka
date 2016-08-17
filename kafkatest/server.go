@@ -488,8 +488,8 @@ func (s *Server) getTopicOffset(group, topic string, partID int32) *topicOffset 
 }
 
 func (s *Server) handleOffsetFetchRequest(nodeID int32, conn net.Conn, req *proto.OffsetFetchReq) response {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	resp := &proto.OffsetFetchResp{
 		CorrelationID: req.CorrelationID,
