@@ -14,6 +14,12 @@ type backend struct {
 	addr    string
 	channel chan *connection
 	counter *int32
+
+	// Used for storing links to all connections we ever make, this is a debugging
+	// tool to try to help find leaks of connections. All access is protected by mu.
+	mu        *sync.Mutex
+	conns     []*connection
+	debugTime time.Time
 }
 
 // getIdleConnection returns a connection if and only if there is an active, idle connection
@@ -25,9 +31,7 @@ func (b *backend) GetIdleConnection() *connection {
 			if !conn.IsClosed() {
 				return conn
 			}
-
-			// The connection closed, so decrement our counter.
-			atomic.AddInt32(b.counter, -1)
+			b.removeConnection(conn)
 
 		default:
 			return nil
@@ -51,9 +55,7 @@ func (b *backend) GetConnection() *connection {
 			if !conn.IsClosed() {
 				return conn
 			}
-
-			// The connection closed, so decrement our counter.
-			atomic.AddInt32(b.counter, -1)
+			b.removeConnection(conn)
 
 		case <-time.After(time.Duration(rndIntn(int(b.conf.IdleConnectionWait)))):
 			conn, err := b.getNewConnection()
@@ -66,31 +68,79 @@ func (b *backend) GetConnection() *connection {
 	}
 }
 
+// debugHitMaxConnections will potentially do some debugging output to help diagnose situations
+// where we're hitting connection limits.
+func (b *backend) debugHitMaxConnections() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if time.Now().Before(b.debugTime) {
+		return
+	}
+	b.debugTime = time.Now().Add(10 * time.Second)
+
+	log.Warn("DEBUG: hit max connections",
+		"counter", atomic.LoadInt32(b.counter),
+		"len(conns)", len(b.conns))
+	for idx, conn := range b.conns {
+		log.Warn("DEBUG", "connection",
+			"idx", idx,
+			"conn", conn,
+			"closed", conn.IsClosed(),
+			"age", time.Now().Sub(conn.StartTime()))
+	}
+}
+
 // getNewConnection establishes a new connection if and only if we haven't hit the limit, else
 // it will return nil. If an error is returned, we failed to connect to the server and should
 // abort the flow.
 func (b *backend) getNewConnection() (*connection, error) {
-	for {
-		if ctr := b.NumOpenConnections(); int(ctr) >= b.conf.ConnectionLimit {
-			return nil, nil
-		} else {
-			// Now attempt to increment and swap to ensure we don't race.
-			if !atomic.CompareAndSwapInt32(b.counter, int32(ctr), int32(ctr)+1) {
-				log.Debug("failed counter race", "addr", b.addr)
-				continue
-			}
-
-			// Incremented. Create new connection and return it.
-			log.Debug("making new connection", "addr", b.addr)
-			conn, err := newTCPConnection(b.addr, b.conf.DialTimeout)
-			if err != nil {
-				atomic.AddInt32(b.counter, -1)
-				log.Error("cannot connect", "addr", b.addr, "error", err)
-				return nil, err
-			}
-			return conn, nil
+	if ctr := b.NumOpenConnections(); int(ctr) >= b.conf.ConnectionLimit {
+		go b.debugHitMaxConnections()
+		return nil, nil
+	} else {
+		// Create new connection and return it.
+		log.Debug("making new connection", "addr", b.addr)
+		conn, err := newTCPConnection(b.addr, b.conf.DialTimeout)
+		if err != nil {
+			log.Error("cannot connect", "addr", b.addr, "error", err)
+			return nil, err
 		}
+		b.storeConnection(conn)
+		return conn, nil
 	}
+}
+
+// storeConnection synchronously increments our counter and then stores a connection in our list
+// of connections asynchronously.
+func (b *backend) storeConnection(conn *connection) {
+	atomic.AddInt32(b.counter, 1)
+
+	go func() {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+
+		b.conns = append(b.conns, conn)
+	}()
+}
+
+// removeConnection decrements the counter immediately and then asynchronously removes
+// the connection from our internal list.
+func (b *backend) removeConnection(conn *connection) {
+	atomic.AddInt32(b.counter, -1)
+
+	go func() {
+		b.mu.Lock()
+		go b.mu.Unlock()
+
+		for idx, c := range b.conns {
+			if c == conn {
+				b.conns = append(b.conns[0:idx], b.conns[idx+1:]...)
+				return
+			}
+		}
+		log.Error("unknown connection in removeConnection", "conn", conn)
+	}()
 }
 
 // Idle is called when a connection should be returned to the store.
@@ -98,14 +148,14 @@ func (b *backend) Idle(conn *connection) {
 	// If the connection is closed, throw it away. But if the connection pool is closed, then
 	// close the connection.
 	if conn.IsClosed() {
-		atomic.AddInt32(b.counter, -1)
+		b.removeConnection(conn)
 		return
 	}
 
 	// If we're above the idle connection limit, discard the connection.
 	if len(b.channel) >= b.conf.IdleConnectionLimit {
 		conn.Close()
-		atomic.AddInt32(b.counter, -1)
+		b.removeConnection(conn)
 		return
 	}
 
@@ -114,7 +164,7 @@ func (b *backend) Idle(conn *connection) {
 		// Do nothing, connection was requeued.
 	case <-time.After(b.conf.IdleConnectionWait):
 		// The queue is full for a while, discard this connection.
-		atomic.AddInt32(b.counter, -1)
+		b.removeConnection(conn)
 		conn.Close()
 	}
 }
@@ -150,6 +200,7 @@ func newConnectionPool(conf BrokerConf) *connectionPool {
 // newBackend creates a new backend structure.
 func (cp *connectionPool) newBackend(addr string) *backend {
 	return &backend{
+		mu:      &sync.Mutex{},
 		conf:    cp.conf,
 		addr:    addr,
 		channel: make(chan *connection, cp.conf.IdleConnectionLimit),
