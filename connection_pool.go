@@ -3,7 +3,6 @@ package kafka
 import (
 	"errors"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -13,12 +12,12 @@ type backend struct {
 	conf    BrokerConf
 	addr    string
 	channel chan *connection
-	counter *int32
 
 	// Used for storing links to all connections we ever make, this is a debugging
 	// tool to try to help find leaks of connections. All access is protected by mu.
 	mu        *sync.Mutex
 	conns     []*connection
+	counter   int
 	debugTime time.Time
 }
 
@@ -80,7 +79,7 @@ func (b *backend) debugHitMaxConnections() {
 	b.debugTime = time.Now().Add(10 * time.Second)
 
 	log.Warn("DEBUG: hit max connections",
-		"counter", atomic.LoadInt32(b.counter),
+		"counter", b.counter,
 		"len(conns)", len(b.conns))
 	for idx, conn := range b.conns {
 		log.Warn("DEBUG", "connection",
@@ -93,54 +92,43 @@ func (b *backend) debugHitMaxConnections() {
 
 // getNewConnection establishes a new connection if and only if we haven't hit the limit, else
 // it will return nil. If an error is returned, we failed to connect to the server and should
-// abort the flow.
+// abort the flow. This takes a lock on the mutex which means we can only have a single new
+// connection request in-flight at one time. Takes the mutex.
 func (b *backend) getNewConnection() (*connection, error) {
-	if ctr := b.NumOpenConnections(); int(ctr) >= b.conf.ConnectionLimit {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.counter >= b.conf.ConnectionLimit {
 		go b.debugHitMaxConnections()
 		return nil, nil
-	} else {
-		// Create new connection and return it.
-		log.Debug("making new connection", "addr", b.addr)
-		conn, err := newTCPConnection(b.addr, b.conf.DialTimeout)
-		if err != nil {
-			log.Error("cannot connect", "addr", b.addr, "error", err)
-			return nil, err
-		}
-		b.storeConnection(conn)
-		return conn, nil
 	}
+
+	log.Debug("making new connection", "addr", b.addr)
+	conn, err := newTCPConnection(b.addr, b.conf.DialTimeout)
+	if err != nil {
+		log.Error("cannot connect", "addr", b.addr, "error", err)
+		return nil, err
+	}
+
+	b.counter++
+	b.conns = append(b.conns, conn)
+	return conn, nil
 }
 
-// storeConnection synchronously increments our counter and then stores a connection in our list
-// of connections asynchronously.
-func (b *backend) storeConnection(conn *connection) {
-	atomic.AddInt32(b.counter, 1)
-
-	go func() {
-		b.mu.Lock()
-		defer b.mu.Unlock()
-
-		b.conns = append(b.conns, conn)
-	}()
-}
-
-// removeConnection decrements the counter immediately and then asynchronously removes
-// the connection from our internal list.
+// removeConnection removes the given connection from our tracking. It also decrements the
+// open connection count. This takes the mutex.
 func (b *backend) removeConnection(conn *connection) {
-	atomic.AddInt32(b.counter, -1)
+	b.mu.Lock()
+	defer b.mu.Unlock()
 
-	go func() {
-		b.mu.Lock()
-		go b.mu.Unlock()
-
-		for idx, c := range b.conns {
-			if c == conn {
-				b.conns = append(b.conns[0:idx], b.conns[idx+1:]...)
-				return
-			}
+	for idx, c := range b.conns {
+		if c == conn {
+			b.counter--
+			b.conns = append(b.conns[0:idx], b.conns[idx+1:]...)
+			return
 		}
-		log.Error("unknown connection in removeConnection", "conn", conn)
-	}()
+	}
+	log.Error("unknown connection in removeConnection", "conn", conn)
 }
 
 // Idle is called when a connection should be returned to the store.
@@ -171,7 +159,10 @@ func (b *backend) Idle(conn *connection) {
 
 // NumOpenConnections returns a counter of how may connections are open.
 func (b *backend) NumOpenConnections() int {
-	return int(atomic.LoadInt32(b.counter))
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.counter
 }
 
 // connectionPool is a way for us to manage multiple connections to a Kafka broker in a way
@@ -204,7 +195,6 @@ func (cp *connectionPool) newBackend(addr string) *backend {
 		conf:    cp.conf,
 		addr:    addr,
 		channel: make(chan *connection, cp.conf.IdleConnectionLimit),
-		counter: new(int32),
 	}
 }
 
