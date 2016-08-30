@@ -19,10 +19,11 @@ var ErrClosed = errors.New("closed")
 
 // Low level abstraction over connection to Kafka.
 type connection struct {
-	addr   string
-	rw     io.ReadWriteCloser
-	stop   chan struct{}
-	nextID chan int32
+	addr      string
+	startTime time.Time
+	rw        io.ReadWriteCloser
+	stop      chan struct{}
+	nextID    chan int32
 
 	// mu protects the following members. It must only be accessed by connection methods.
 	mu    *sync.Mutex
@@ -40,12 +41,13 @@ func newTCPConnection(address string, timeout time.Duration) (*connection, error
 		return nil, err
 	}
 	c := &connection{
-		addr:   address,
-		mu:     &sync.Mutex{},
-		stop:   make(chan struct{}),
-		nextID: make(chan int32),
-		rw:     conn,
-		respc:  make(map[int32]chan []byte),
+		addr:      address,
+		mu:        &sync.Mutex{},
+		stop:      make(chan struct{}),
+		nextID:    make(chan int32),
+		rw:        conn,
+		respc:     make(map[int32]chan []byte),
+		startTime: time.Now(),
 	}
 	go c.nextIDLoop()
 	go c.readRespLoop()
@@ -154,6 +156,11 @@ func (c *connection) releaseWaiter(correlationID int32) {
 		delete(c.respc, correlationID)
 		close(rc)
 	}
+}
+
+// StartTime returns the time the connection was established.
+func (c *connection) StartTime() time.Time {
+	return c.startTime
 }
 
 // Close close underlying transport connection and cancel all pending response

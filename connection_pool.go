@@ -3,7 +3,6 @@ package kafka
 import (
 	"errors"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -13,7 +12,13 @@ type backend struct {
 	conf    BrokerConf
 	addr    string
 	channel chan *connection
-	counter *int32
+
+	// Used for storing links to all connections we ever make, this is a debugging
+	// tool to try to help find leaks of connections. All access is protected by mu.
+	mu        *sync.Mutex
+	conns     []*connection
+	counter   int
+	debugTime time.Time
 }
 
 // getIdleConnection returns a connection if and only if there is an active, idle connection
@@ -25,9 +30,7 @@ func (b *backend) GetIdleConnection() *connection {
 			if !conn.IsClosed() {
 				return conn
 			}
-
-			// The connection closed, so decrement our counter.
-			atomic.AddInt32(b.counter, -1)
+			b.removeConnection(conn)
 
 		default:
 			return nil
@@ -51,9 +54,7 @@ func (b *backend) GetConnection() *connection {
 			if !conn.IsClosed() {
 				return conn
 			}
-
-			// The connection closed, so decrement our counter.
-			atomic.AddInt32(b.counter, -1)
+			b.removeConnection(conn)
 
 		case <-time.After(time.Duration(rndIntn(int(b.conf.IdleConnectionWait)))):
 			conn, err := b.getNewConnection()
@@ -66,31 +67,68 @@ func (b *backend) GetConnection() *connection {
 	}
 }
 
+// debugHitMaxConnections will potentially do some debugging output to help diagnose situations
+// where we're hitting connection limits.
+func (b *backend) debugHitMaxConnections() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if time.Now().Before(b.debugTime) {
+		return
+	}
+	b.debugTime = time.Now().Add(10 * time.Second)
+
+	log.Warn("DEBUG: hit max connections",
+		"counter", b.counter,
+		"len(conns)", len(b.conns))
+	for idx, conn := range b.conns {
+		log.Warn("DEBUG", "connection",
+			"idx", idx,
+			"conn", conn,
+			"closed", conn.IsClosed(),
+			"age", time.Now().Sub(conn.StartTime()))
+	}
+}
+
 // getNewConnection establishes a new connection if and only if we haven't hit the limit, else
 // it will return nil. If an error is returned, we failed to connect to the server and should
-// abort the flow.
+// abort the flow. This takes a lock on the mutex which means we can only have a single new
+// connection request in-flight at one time. Takes the mutex.
 func (b *backend) getNewConnection() (*connection, error) {
-	for {
-		if ctr := b.NumOpenConnections(); int(ctr) >= b.conf.ConnectionLimit {
-			return nil, nil
-		} else {
-			// Now attempt to increment and swap to ensure we don't race.
-			if !atomic.CompareAndSwapInt32(b.counter, int32(ctr), int32(ctr)+1) {
-				log.Debug("failed counter race", "addr", b.addr)
-				continue
-			}
+	b.mu.Lock()
+	defer b.mu.Unlock()
 
-			// Incremented. Create new connection and return it.
-			log.Debug("making new connection", "addr", b.addr)
-			conn, err := newTCPConnection(b.addr, b.conf.DialTimeout)
-			if err != nil {
-				atomic.AddInt32(b.counter, -1)
-				log.Error("cannot connect", "addr", b.addr, "error", err)
-				return nil, err
-			}
-			return conn, nil
+	if b.counter >= b.conf.ConnectionLimit {
+		go b.debugHitMaxConnections()
+		return nil, nil
+	}
+
+	log.Debug("making new connection", "addr", b.addr)
+	conn, err := newTCPConnection(b.addr, b.conf.DialTimeout)
+	if err != nil {
+		log.Error("cannot connect", "addr", b.addr, "error", err)
+		return nil, err
+	}
+
+	b.counter++
+	b.conns = append(b.conns, conn)
+	return conn, nil
+}
+
+// removeConnection removes the given connection from our tracking. It also decrements the
+// open connection count. This takes the mutex.
+func (b *backend) removeConnection(conn *connection) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	for idx, c := range b.conns {
+		if c == conn {
+			b.counter--
+			b.conns = append(b.conns[0:idx], b.conns[idx+1:]...)
+			return
 		}
 	}
+	log.Error("unknown connection in removeConnection", "conn", conn)
 }
 
 // Idle is called when a connection should be returned to the store.
@@ -98,14 +136,14 @@ func (b *backend) Idle(conn *connection) {
 	// If the connection is closed, throw it away. But if the connection pool is closed, then
 	// close the connection.
 	if conn.IsClosed() {
-		atomic.AddInt32(b.counter, -1)
+		b.removeConnection(conn)
 		return
 	}
 
 	// If we're above the idle connection limit, discard the connection.
 	if len(b.channel) >= b.conf.IdleConnectionLimit {
 		conn.Close()
-		atomic.AddInt32(b.counter, -1)
+		b.removeConnection(conn)
 		return
 	}
 
@@ -114,14 +152,17 @@ func (b *backend) Idle(conn *connection) {
 		// Do nothing, connection was requeued.
 	case <-time.After(b.conf.IdleConnectionWait):
 		// The queue is full for a while, discard this connection.
-		atomic.AddInt32(b.counter, -1)
+		b.removeConnection(conn)
 		conn.Close()
 	}
 }
 
 // NumOpenConnections returns a counter of how may connections are open.
 func (b *backend) NumOpenConnections() int {
-	return int(atomic.LoadInt32(b.counter))
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.counter
 }
 
 // connectionPool is a way for us to manage multiple connections to a Kafka broker in a way
@@ -150,10 +191,10 @@ func newConnectionPool(conf BrokerConf) *connectionPool {
 // newBackend creates a new backend structure.
 func (cp *connectionPool) newBackend(addr string) *backend {
 	return &backend{
+		mu:      &sync.Mutex{},
 		conf:    cp.conf,
 		addr:    addr,
 		channel: make(chan *connection, cp.conf.IdleConnectionLimit),
-		counter: new(int32),
 	}
 }
 
