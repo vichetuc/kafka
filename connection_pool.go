@@ -82,7 +82,7 @@ func (b *backend) debugHitMaxConnections() {
 		"counter", b.counter,
 		"len(conns)", len(b.conns))
 	for idx, conn := range b.conns {
-		log.Warn("DEBUG", "connection",
+		log.Warn("DEBUG: connection",
 			"idx", idx,
 			"conn", conn,
 			"closed", conn.IsClosed(),
@@ -103,16 +103,41 @@ func (b *backend) getNewConnection() (*connection, error) {
 		return nil, nil
 	}
 
-	log.Debug("making new connection", "addr", b.addr)
-	conn, err := newTCPConnection(b.addr, b.conf.DialTimeout)
-	if err != nil {
-		log.Error("cannot connect", "addr", b.addr, "error", err)
-		return nil, err
+	// Be careful about the situation where newTCPConnection could never return, so
+	// we want to always make sure getNewConnection eventually returns. Else, we can
+	// lose the connection pool.
+
+	type connResult struct {
+		conn *connection
+		err  error
+	}
+	connChan := make(chan connResult, 1)
+
+	go func() {
+		log.Debug("making new connection", "addr", b.addr)
+		if conn, err := newTCPConnection(b.addr, b.conf.DialTimeout); err != nil {
+			log.Error("cannot connect", "addr", b.addr, "error", err)
+			connChan <- connResult{nil, err}
+		} else {
+			connChan <- connResult{conn, nil}
+		}
+	}()
+
+	select {
+	case <-time.After(b.conf.DialTimeout):
+		log.Error("DEBUG: timeout waiting for dial", "addr", b.addr)
+		return nil, nil
+
+	case result := <-connChan:
+		if result.err != nil {
+			return nil, result.err
+		} else {
+			b.counter++
+			b.conns = append(b.conns, result.conn)
+			return result.conn, nil
+		}
 	}
 
-	b.counter++
-	b.conns = append(b.conns, conn)
-	return conn, nil
 }
 
 // removeConnection removes the given connection from our tracking. It also decrements the
