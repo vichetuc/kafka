@@ -352,11 +352,6 @@ func (cp *connectionPool) IsClosed() bool {
 // called in a goroutine so as not to block the original caller, as this function may take
 // some time to return.
 func (cp *connectionPool) Idle(conn *connection) {
-	if cp.IsClosed() {
-		conn.Close()
-		return
-	}
-
 	if be := cp.getOrCreateBackend(conn.addr); be != nil {
 		be.Idle(conn)
 	} else {
