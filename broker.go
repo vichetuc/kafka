@@ -201,13 +201,9 @@ type nodeMap map[int32]string
 // Broker is an abstract connection to kafka cluster, managing connections to
 // all kafka nodes.
 type Broker struct {
-	conf BrokerConf
-
-	// mu protects all read/write accesses to the metadata/conns structures. This
-	// lock must not be held during network operations.
-	mu       *sync.Mutex
-	metadata *clusterMetadata
-	conns    *connectionPool
+	conf     BrokerConf
+	conns    connectionPool
+	metadata clusterMetadata
 }
 
 // SetLogger provides a logging instance. Should be called before any Dial or
@@ -221,13 +217,11 @@ func SetLogger(logger Logger) {
 //
 // The returned broker is not initially connected to any kafka node.
 func Dial(nodeAddresses []string, conf BrokerConf) (*Broker, error) {
-	pool := newConnectionPool(conf)
 	broker := &Broker{
-		mu:       &sync.Mutex{},
-		conf:     conf,
-		conns:    pool,
-		metadata: newClusterMetadata(conf, pool),
+		conf:  conf,
+		conns: newConnectionPool(conf),
 	}
+	broker.metadata = newClusterMetadata(conf, &broker.conns)
 
 	if len(nodeAddresses) == 0 {
 		return nil, errors.New("no addresses provided")
@@ -270,9 +264,6 @@ func Dial(nodeAddresses []string, conf BrokerConf) (*Broker, error) {
 
 // Close closes the broker and all active kafka nodes connections.
 func (b *Broker) Close() {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
 	b.conns.Close()
 }
 
@@ -840,10 +831,7 @@ func (b *Broker) consumer(conf ConsumerConf) (*consumer, error) {
 }
 
 func (b *Broker) IsClosed() bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	return b.conns == nil || b.conns.IsClosed()
+	return b.conns.IsClosed()
 }
 
 // consume is returning a batch of messages from consumed partition.
