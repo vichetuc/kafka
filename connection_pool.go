@@ -204,8 +204,8 @@ type connectionPool struct {
 }
 
 // newConnectionPool creates a connection pool and initializes it.
-func newConnectionPool(conf BrokerConf) *connectionPool {
-	return &connectionPool{
+func newConnectionPool(conf BrokerConf) connectionPool {
+	return connectionPool{
 		conf:     conf,
 		mu:       &sync.RWMutex{},
 		backends: make(map[string]*backend),
@@ -352,6 +352,10 @@ func (cp *connectionPool) IsClosed() bool {
 // called in a goroutine so as not to block the original caller, as this function may take
 // some time to return.
 func (cp *connectionPool) Idle(conn *connection) {
+	if conn == nil {
+		return
+	}
+
 	if be := cp.getOrCreateBackend(conn.addr); be != nil {
 		be.Idle(conn)
 	} else {

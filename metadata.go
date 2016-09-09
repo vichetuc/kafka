@@ -26,8 +26,8 @@ type clusterMetadata struct {
 	partitions map[string]int32         // topic to numer of partitions
 }
 
-func newClusterMetadata(conf BrokerConf, pool *connectionPool) *clusterMetadata {
-	result := &clusterMetadata{
+func newClusterMetadata(conf BrokerConf, pool *connectionPool) clusterMetadata {
+	result := clusterMetadata{
 		mu:      &sync.RWMutex{},
 		timeout: conf.MetadataRefreshTimeout,
 		refLock: &sync.Mutex{},
