@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"strconv"
@@ -13,7 +12,15 @@ import (
 	"sync"
 
 	"github.com/dropbox/kafka/proto"
+	"github.com/op/go-logging"
 )
+
+var log *logging.Logger
+
+func init() {
+	log = logging.MustGetLogger("KafkaTest")
+	logging.SetLevel(logging.INFO, "KafkaTest")
+}
 
 type topicOffset struct {
 	offset   int64
@@ -116,7 +123,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"brokers": s.brokers,
 	})
 	if err != nil {
-		log.Printf("cannot JSON encode state: %s", err)
+		log.Errorf("cannot JSON encode state: %s", err)
 	}
 }
 
@@ -150,51 +157,60 @@ func (s *Server) AddMessages(topic string, partition int32, messages ...*proto.M
 	}
 }
 
-// Run starts kafka mock server listening on given address.
+// Run starts kafka mock server listening on given address. Function only
+// returns when the listener has exited.
 func (s *Server) Run(addr string) error {
 	const nodeID = 100
 
-	s.mu.RLock()
-	if s.ln != nil {
-		s.mu.RUnlock()
-		log.Printf("server already running: %s", s.ln.Addr())
-		return fmt.Errorf("server already running: %s", s.ln.Addr())
-	}
+	ln, err := func() (net.Listener, error) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
 
-	ln, err := net.Listen("tcp4", addr)
-	if err != nil {
-		s.mu.RUnlock()
-		log.Printf("cannot listen on address %q: %s", addr, err)
-		return fmt.Errorf("cannot listen: %s", err)
-	}
-	defer func() {
-		_ = ln.Close()
-	}()
-	s.ln = ln
-
-	if host, port, err := net.SplitHostPort(ln.Addr().String()); err != nil {
-		s.mu.RUnlock()
-		log.Printf("cannot extract host/port from %q: %s", ln.Addr(), err)
-		return fmt.Errorf("cannot extract host/port from %q: %s", ln.Addr(), err)
-	} else {
-		prt, err := strconv.Atoi(port)
-		if err != nil {
-			s.mu.RUnlock()
-			log.Printf("invalid port %q: %s", port, err)
-			return fmt.Errorf("invalid port %q: %s", port, err)
+		if s.ln != nil {
+			log.Errorf("server already running: %s", s.ln.Addr())
+			return nil, fmt.Errorf("server already running: %s", s.ln.Addr())
 		}
-		s.brokers = append(s.brokers, proto.MetadataRespBroker{
-			NodeID: nodeID,
-			Host:   host,
-			Port:   int32(prt),
-		})
-	}
-	s.mu.RUnlock()
 
+		ln, err := net.Listen("tcp4", addr)
+		if err != nil {
+			log.Errorf("cannot listen on address %q: %s", addr, err)
+			return nil, fmt.Errorf("cannot listen: %s", err)
+		}
+
+		s.ln = ln
+		s.started = true
+
+		if host, port, err := net.SplitHostPort(ln.Addr().String()); err != nil {
+			log.Errorf("cannot extract host/port from %q: %s", ln.Addr(), err)
+			return nil, fmt.Errorf("cannot extract host/port from %q: %s", ln.Addr(), err)
+		} else {
+			prt, err := strconv.Atoi(port)
+			if err != nil {
+				log.Errorf("invalid port %q: %s", port, err)
+				return nil, fmt.Errorf("invalid port %q: %s", port, err)
+			}
+			s.brokers = append(s.brokers, proto.MetadataRespBroker{
+				NodeID: nodeID,
+				Host:   host,
+				Port:   int32(prt),
+			})
+		}
+		return ln, nil
+	}()
+	if err != nil {
+		return err
+	}
+
+	// Defer the stop/close so we shut down properly
+	defer s.Close()
+
+	// Handle incoming connections for a long time
 	for {
-		conn, err := ln.Accept()
-		if err == nil {
+		if conn, err := ln.Accept(); err == nil {
 			go s.handleClient(nodeID, conn)
+		} else {
+			log.Errorf("failed to accept: %s", err)
+			return fmt.Errorf("failed to accept: %s", err)
 		}
 	}
 }
@@ -252,7 +268,7 @@ func (s *Server) handleClient(nodeID int32, conn net.Conn) {
 		kind, b, err := proto.ReadReq(conn)
 		if err != nil {
 			if err != io.EOF {
-				log.Printf("client read error: %s", err)
+				log.Errorf("client read error: %s", err)
 			}
 			return
 		}
@@ -271,68 +287,68 @@ func (s *Server) handleClient(nodeID int32, conn net.Conn) {
 			case proto.ProduceReqKind:
 				req, err := proto.ReadProduceReq(bytes.NewBuffer(b))
 				if err != nil {
-					log.Printf("cannot parse produce request: %s\n%s", err, b)
+					log.Errorf("cannot parse produce request: %s\n%s", err, b)
 					return
 				}
 				resp = s.handleProduceRequest(nodeID, conn, req)
 			case proto.FetchReqKind:
 				req, err := proto.ReadFetchReq(bytes.NewBuffer(b))
 				if err != nil {
-					log.Printf("cannot parse fetch request: %s\n%s", err, b)
+					log.Errorf("cannot parse fetch request: %s\n%s", err, b)
 					return
 				}
 				resp = s.handleFetchRequest(nodeID, conn, req)
 			case proto.OffsetReqKind:
 				req, err := proto.ReadOffsetReq(bytes.NewBuffer(b))
 				if err != nil {
-					log.Printf("cannot parse offset request: %s\n%s", err, b)
+					log.Errorf("cannot parse offset request: %s\n%s", err, b)
 					return
 				}
 				resp = s.handleOffsetRequest(nodeID, conn, req)
 			case proto.MetadataReqKind:
 				req, err := proto.ReadMetadataReq(bytes.NewBuffer(b))
 				if err != nil {
-					log.Printf("cannot parse metadata request: %s\n%s", err, b)
+					log.Errorf("cannot parse metadata request: %s\n%s", err, b)
 					return
 				}
 				resp = s.handleMetadataRequest(nodeID, conn, req)
 			case proto.OffsetCommitReqKind:
 				req, err := proto.ReadOffsetCommitReq(bytes.NewBuffer(b))
 				if err != nil {
-					log.Printf("cannot parse offset commit request: %s\n%s", err, b)
+					log.Errorf("cannot parse offset commit request: %s\n%s", err, b)
 					return
 				}
 				resp = s.handleOffsetCommitRequest(nodeID, conn, req)
 			case proto.OffsetFetchReqKind:
 				req, err := proto.ReadOffsetFetchReq(bytes.NewBuffer(b))
 				if err != nil {
-					log.Printf("cannot parse offset fetch request: %s\n%s", err, b)
+					log.Errorf("cannot parse offset fetch request: %s\n%s", err, b)
 					return
 				}
 				resp = s.handleOffsetFetchRequest(nodeID, conn, req)
 			case proto.ConsumerMetadataReqKind:
 				req, err := proto.ReadConsumerMetadataReq(bytes.NewBuffer(b))
 				if err != nil {
-					log.Printf("cannot parse consumer metadata request: %s\n%s", err, b)
+					log.Errorf("cannot parse consumer metadata request: %s\n%s", err, b)
 					return
 				}
 				resp = s.handleConsumerMetadataRequest(nodeID, conn, req)
 			default:
-				log.Printf("unknown request: %d\n%s", kind, b)
+				log.Errorf("unknown request: %d\n%s", kind, b)
 				return
 			}
 		}
 
 		if resp == nil {
-			log.Printf("no response for %d", kind)
+			log.Errorf("no response for %d", kind)
 			return
 		}
 		b, err = resp.Bytes()
 		if err != nil {
-			log.Printf("cannot serialize %T response: %s", resp, err)
+			log.Errorf("cannot serialize %T response: %s", resp, err)
 		}
 		if _, err := conn.Write(b); err != nil {
-			log.Printf("cannot write %T response: %s", resp, err)
+			log.Errorf("cannot write %T response: %s", resp, err)
 			return
 		}
 	}
@@ -342,7 +358,9 @@ type response interface {
 	Bytes() ([]byte, error)
 }
 
-func (s *Server) handleProduceRequest(nodeID int32, conn net.Conn, req *proto.ProduceReq) response {
+func (s *Server) handleProduceRequest(
+	nodeID int32, conn net.Conn, req *proto.ProduceReq) response {
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -369,6 +387,8 @@ func (s *Server) handleProduceRequest(nodeID int32, conn net.Conn, req *proto.Pr
 				t[part.ID] = p
 			}
 
+			log.Infof("produced %d messages to %s:%d at offset %d",
+				len(part.Messages), topic.Name, part.ID, len(t[part.ID]))
 			for _, msg := range part.Messages {
 				msg.Offset = int64(len(t[part.ID]))
 				msg.Topic = topic.Name
@@ -382,7 +402,9 @@ func (s *Server) handleProduceRequest(nodeID int32, conn net.Conn, req *proto.Pr
 	return resp
 }
 
-func (s *Server) handleFetchRequest(nodeID int32, conn net.Conn, req *proto.FetchReq) response {
+func (s *Server) handleFetchRequest(
+	nodeID int32, conn net.Conn, req *proto.FetchReq) response {
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -413,13 +435,17 @@ func (s *Server) handleFetchRequest(nodeID int32, conn net.Conn, req *proto.Fetc
 			}
 			respParts[pi].TipOffset = int64(len(messages))
 			respParts[pi].Messages = messages[part.FetchOffset:]
+			log.Infof("fetched %d messages from %s:%d at offset %d",
+				len(respParts[pi].Messages), topic.Name, part.ID, part.FetchOffset)
 		}
 	}
 
 	return resp
 }
 
-func (s *Server) handleOffsetRequest(nodeID int32, conn net.Conn, req *proto.OffsetReq) response {
+func (s *Server) handleOffsetRequest(
+	nodeID int32, conn net.Conn, req *proto.OffsetReq) response {
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -434,15 +460,24 @@ func (s *Server) handleOffsetRequest(nodeID int32, conn net.Conn, req *proto.Off
 		for pi, part := range topic.Partitions {
 			respPart[pi].ID = part.ID
 			switch part.TimeMs {
-			case -1: // oldest
+			case -1: // latest
 				msgs := len(s.topics[topic.Name][part.ID])
 				respPart[pi].Offsets = []int64{int64(msgs), 0}
+				log.Infof("requested latest offset from %s:%d, returning %d",
+					topic.Name, part.ID, msgs)
 			case -2: // earliest
 				respPart[pi].Offsets = []int64{0, 0}
+				log.Infof("requested earliest offset from %s:%d, returning %d",
+					topic.Name, part.ID, 0)
 			default:
-				log.Printf("offset time for %s:%d not supported: %d", topic.Name, part.ID, part.TimeMs)
+				log.Errorf("offset time for %s:%d not supported: %d",
+					topic.Name, part.ID, part.TimeMs)
 				return nil
 			}
+
+			// Now if they've asked for fewer, cut some off -- unclear if this
+			// is correct but it seems so given what we support right now
+			respPart[pi].Offsets = respPart[pi].Offsets[0:part.MaxOffsets]
 		}
 	}
 	return resp
@@ -453,6 +488,8 @@ func (s *Server) handleConsumerMetadataRequest(
 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+
+	log.Infof("requested consumer metadata")
 
 	addrps := strings.Split(s.Addr(), ":")
 	port, _ := strconv.Atoi(addrps[1])
@@ -487,7 +524,9 @@ func (s *Server) getTopicOffset(group, topic string, partID int32) *topicOffset 
 	return toffset
 }
 
-func (s *Server) handleOffsetFetchRequest(nodeID int32, conn net.Conn, req *proto.OffsetFetchReq) response {
+func (s *Server) handleOffsetFetchRequest(
+	nodeID int32, conn net.Conn, req *proto.OffsetFetchReq) response {
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -504,12 +543,16 @@ func (s *Server) handleOffsetFetchRequest(nodeID int32, conn net.Conn, req *prot
 			respPart[pi].ID = part
 			respPart[pi].Metadata = toffset.metadata
 			respPart[pi].Offset = toffset.offset
+			log.Infof("requested committed offset for group %s from %s:%d, returning %d",
+				req.ConsumerGroup, topic.Name, part, toffset)
 		}
 	}
 	return resp
 }
 
-func (s *Server) handleOffsetCommitRequest(nodeID int32, conn net.Conn, req *proto.OffsetCommitReq) response {
+func (s *Server) handleOffsetCommitRequest(
+	nodeID int32, conn net.Conn, req *proto.OffsetCommitReq) response {
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -527,14 +570,20 @@ func (s *Server) handleOffsetCommitRequest(nodeID int32, conn net.Conn, req *pro
 			toffset.offset = part.Offset
 
 			respPart[pi].ID = part.ID
+			log.Infof("committed offset for group %s from %s:%d, saved %d",
+				req.ConsumerGroup, topic.Name, part.ID, part.Offset)
 		}
 	}
 	return resp
 }
 
-func (s *Server) handleMetadataRequest(nodeID int32, conn net.Conn, req *proto.MetadataReq) response {
+func (s *Server) handleMetadataRequest(
+	nodeID int32, conn net.Conn, req *proto.MetadataReq) response {
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+
+	log.Infof("requested metadata")
 
 	resp := &proto.MetadataResp{
 		CorrelationID: req.CorrelationID,
