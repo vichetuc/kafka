@@ -82,7 +82,6 @@ type Producer interface {
 type OffsetCoordinator interface {
 	Commit(topic string, partition int32, offset int64) error
 	Offset(topic string, partition int32) (offset int64, metadata string, err error)
-	Close()
 }
 
 type topicPartition struct {
@@ -374,7 +373,9 @@ func (b *Broker) leaderConnection(
 	return nil, err
 }
 
-// coordinatorConnection returns connection to offset coordinator for given group.
+// coordinatorConnection returns connection to offset coordinator for given group. NOTE:
+// this function returns a connection and it is the caller's responsibility to ensure
+// that this connection is eventually returned to the pool with Idle.
 //
 // Failed connection retry is controlled by broker configuration.
 func (b *Broker) coordinatorConnection(consumerGroup string) (conn *connection, resErr error) {
@@ -429,6 +430,8 @@ func (b *Broker) coordinatorConnection(consumerGroup string) (conn *connection, 
 				resErr = err
 				continue
 			}
+
+			// Return to caller, they must ensure Idle is eventually called
 			return conn, nil
 		}
 
@@ -1020,15 +1023,9 @@ type offsetCoordinator struct {
 // OffsetCoordinator returns offset management coordinator for single consumer
 // group, bound to broker.
 func (b *Broker) OffsetCoordinator(conf OffsetCoordinatorConf) (OffsetCoordinator, error) {
-	conn, err := b.coordinatorConnection(conf.ConsumerGroup)
-	if err != nil {
-		return nil, err
-	}
 	c := &offsetCoordinator{
 		broker: b,
-		mu:     &sync.Mutex{},
 		conf:   conf,
-		conn:   conn,
 	}
 	return c, nil
 }
@@ -1048,33 +1045,6 @@ func (c *offsetCoordinator) CommitFull(topic string, partition int32, offset int
 	return c.commit(topic, partition, offset, metadata)
 }
 
-// getConnection returns a copy of the connection. This takes the lock so that we
-// ensure we get a consistent copy.
-func (c *offsetCoordinator) getConnection() (*connection, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	// Only return the connection if it's still open. It can have closed for some reason
-	// by someone else.
-	if c.conn != nil && !c.conn.IsClosed() {
-		return c.conn, nil
-	}
-
-	// connection can be set to nil if previously reference connection died. We do this in
-	// the lock because otherwise everybody might rush to create new connections and then
-	// overwrite each other. This lock is scoped small enough that we're OK waiting for the
-	// network operation within the lock.
-	conn, err := c.broker.coordinatorConnection(c.conf.ConsumerGroup)
-	if err != nil {
-		log.Debug("cannot connect to coordinator",
-			"consumGrp", c.conf.ConsumerGroup,
-			"error", err)
-		return nil, err
-	}
-	c.conn = conn
-	return c.conn, nil
-}
-
 // commit is saving offset and metadata information. Provides limited error
 // handling configurable through OffsetCoordinatorConf.
 func (c *offsetCoordinator) commit(
@@ -1088,11 +1058,12 @@ func (c *offsetCoordinator) commit(
 
 		// get a copy of our connection with the lock, this might establish a new
 		// connection so can take a bit
-		conn, err := c.getConnection()
+		conn, err := c.broker.coordinatorConnection(c.conf.ConsumerGroup)
 		if conn == nil {
 			resErr = err
 			continue
 		}
+		defer func() { go c.broker.conns.Idle(conn) }()
 
 		resp, err := conn.OffsetCommit(&proto.OffsetCommitReq{
 			ClientID:      c.broker.conf.ClientID,
@@ -1156,11 +1127,12 @@ func (c *offsetCoordinator) Offset(topic string, partition int32) (offset int64,
 
 		// get a copy of our connection with the lock, this might establish a new
 		// connection so can take a bit
-		conn, err := c.getConnection()
+		conn, err := c.broker.coordinatorConnection(c.conf.ConsumerGroup)
 		if conn == nil {
 			resErr = err
 			continue
 		}
+		defer func() { go c.broker.conns.Idle(conn) }()
 
 		resp, err := conn.OffsetFetch(&proto.OffsetFetchReq{
 			ConsumerGroup: c.conf.ConsumerGroup,
@@ -1208,19 +1180,6 @@ func (c *offsetCoordinator) Offset(topic string, partition int32) (offset int64,
 	}
 
 	return 0, "", resErr
-}
-
-// Close releases the underlying connection back to the broker pool. Calling
-// clients should assume the coordinator cannot be re-used once it has been
-// closed.
-func (c *offsetCoordinator) Close() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.conn != nil && !c.conn.IsClosed() {
-		go c.broker.conns.Idle(c.conn)
-		c.conn = nil
-	}
 }
 
 // rndIntn adds locking around accessing the random number generator. This is required because
