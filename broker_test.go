@@ -2027,7 +2027,10 @@ func (s *BrokerSuite) TestOffsetCoordinatorNoCoordinatorError(c *C) {
 	c.Assert(err, IsNil)
 
 	coordConf := NewOffsetCoordinatorConf("test-group")
-	_, err = broker.OffsetCoordinator(coordConf)
+	oc, err := broker.OffsetCoordinator(coordConf)
+	c.Assert(err, IsNil)
+
+	err = oc.Commit("foo", int32(0), 10)
 	c.Assert(err, Equals, proto.ErrNoCoordinator)
 }
 

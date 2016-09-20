@@ -98,9 +98,28 @@ func (b *backend) getNewConnection() (*connection, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	// Attempt to determine if we're over quota, if so, first start by cleaning out any
+	// connections that are closed, then recheck. We assert that the quota is only meant
+	// to count against open/in-use connections, so I don't care about closed ones.
 	if b.counter >= b.conf.ConnectionLimit {
-		go b.debugHitMaxConnections()
-		return nil, nil
+		newConns := make([]*connection, 0, b.counter)
+		for _, conn := range b.conns {
+			if !conn.IsClosed() {
+				newConns = append(newConns, conn)
+			}
+		}
+
+		// If the lengths are the same, we truly hit max connections and there's nothing
+		// to do so return
+		if len(newConns) == b.counter {
+			go b.debugHitMaxConnections()
+			return nil, nil
+		}
+
+		// We eliminated one or more closed connections, use the new list and reset our
+		// counter and move forward with setup
+		b.conns = newConns
+		b.counter = len(newConns)
 	}
 
 	// Be careful about the situation where newTCPConnection could never return, so
