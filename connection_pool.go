@@ -172,7 +172,6 @@ func (b *backend) removeConnection(conn *connection) {
 			return
 		}
 	}
-	log.Error("unknown connection in removeConnection", "conn", conn)
 }
 
 // Idle is called when a connection should be returned to the store.
