@@ -228,11 +228,10 @@ type connectionPool struct {
 	// connectionPool.
 	mu     *sync.RWMutex
 	closed bool
-	// Addrs is the set of valid connection destinations, as specified by InitializeAddrs.
-	// Populating this set does not initiate a connection. If an addr is removed from this set,
-	// any active backend pointing to it will be closed.
-	addrs map[string]struct{}
-	// Backends is the subset of addrs to which we have active connections.
+	// The keys of this map is the set of valid connection destinations, as specified by
+	// InitializeAddrs. Adding an addr to this map does not initiate a connection.
+	// If an addr is removed, any active backend pointing to it will be closed and no further
+	// connections can be made.
 	backends map[string]*backend
 }
 
@@ -242,7 +241,6 @@ func newConnectionPool(conf BrokerConf) connectionPool {
 		conf:     conf,
 		mu:       &sync.RWMutex{},
 		backends: make(map[string]*backend),
-		addrs:    make(map[string]struct{}),
 	}
 }
 
@@ -256,49 +254,13 @@ func (cp *connectionPool) newBackend(addr string) *backend {
 	}
 }
 
-// getBackend fetches a channel for a given address. This takes the read lock. If no
-// channel exists, nil is returned.
+// getBackend fetches a backend for a given address or nil if none exists.
 func (cp *connectionPool) getBackend(addr string) *backend {
 	cp.mu.RLock()
 	defer cp.mu.RUnlock()
 
 	if cp.closed {
 		return nil
-	}
-
-	if _, ok := cp.backends[addr]; !ok {
-		return nil
-	}
-	return cp.backends[addr]
-}
-
-// getOrCreateBackend fetches a channel for a given address and, if one doesn't exist,
-// creates it. This function takes the write lock against the pool.
-func (cp *connectionPool) getOrCreateBackend(addr string) *backend {
-	// Fast path: only gets a read lock
-	if be := cp.getBackend(addr); be != nil {
-		return be
-	}
-
-	// Did not exist, take the slow path and make a new backend
-	cp.mu.Lock()
-	defer cp.mu.Unlock()
-
-	if cp.closed {
-		return nil
-	}
-
-	// If the addr being requested is not in the set of valid addrs, do not connect to it.
-	// This is possible when a metadata refresh removes an old addr but there are still in flight
-	// requests to connect to it.
-	if _, ok := cp.addrs[addr]; !ok {
-		log.Warn("Refusing to create backend to unknown addr", "addr", addr)
-		return nil
-	}
-
-	if _, ok := cp.backends[addr]; !ok {
-		cp.addrs[addr] = struct{}{}
-		cp.backends[addr] = cp.newBackend(addr)
 	}
 	return cp.backends[addr]
 }
@@ -309,9 +271,9 @@ func (cp *connectionPool) GetAllAddrs() []string {
 	cp.mu.RLock()
 	defer cp.mu.RUnlock()
 
-	ret := make([]string, len(cp.addrs))
+	ret := make([]string, len(cp.backends))
 	i := 0
-	for addr := range cp.addrs {
+	for addr := range cp.backends {
 		ret[i] = addr
 		i++
 	}
@@ -325,8 +287,13 @@ func (cp *connectionPool) InitializeAddrs(addrs []string) {
 	cp.mu.Lock()
 	defer cp.mu.Unlock()
 
+	if cp.closed {
+		log.Warn("Cannot InitializeAddrs on closed connectionPool.")
+		return
+	}
+
 	deletedAddrs := make(map[string]struct{})
-	for addr := range cp.addrs {
+	for addr := range cp.backends {
 		deletedAddrs[addr] = struct{}{}
 	}
 
@@ -334,7 +301,6 @@ func (cp *connectionPool) InitializeAddrs(addrs []string) {
 		delete(deletedAddrs, addr)
 		if _, ok := cp.backends[addr]; !ok {
 			log.Info("Initializing backend to addr", "addr", addr)
-			cp.addrs[addr] = struct{}{}
 			cp.backends[addr] = cp.newBackend(addr)
 		}
 	}
@@ -344,7 +310,6 @@ func (cp *connectionPool) InitializeAddrs(addrs []string) {
 			backend.Close()
 			delete(cp.backends, addr)
 		}
-		delete(cp.addrs, addr)
 	}
 }
 
@@ -354,7 +319,7 @@ func (cp *connectionPool) GetIdleConnection() *connection {
 	addrs := cp.GetAllAddrs()
 
 	for _, idx := range rndPerm(len(addrs)) {
-		if be := cp.getOrCreateBackend(addrs[idx]); be != nil {
+		if be := cp.getBackend(addrs[idx]); be != nil {
 			if conn := be.GetIdleConnection(); conn != nil {
 				return conn
 			}
@@ -371,7 +336,7 @@ func (cp *connectionPool) GetConnectionByAddr(addr string) (*connection, error) 
 		return nil, errors.New("connection pool is closed")
 	}
 
-	if be := cp.getOrCreateBackend(addr); be != nil {
+	if be := cp.getBackend(addr); be != nil {
 		if conn := be.GetConnection(); conn != nil {
 			return conn, nil
 		}
@@ -388,7 +353,6 @@ func (cp *connectionPool) Close() {
 	for _, backend := range cp.backends {
 		backend.Close()
 	}
-	cp.addrs = nil
 	cp.backends = nil
 	cp.closed = true
 }
@@ -409,7 +373,7 @@ func (cp *connectionPool) Idle(conn *connection) {
 		return
 	}
 
-	if be := cp.getOrCreateBackend(conn.addr); be != nil {
+	if be := cp.getBackend(conn.addr); be != nil {
 		be.Idle(conn)
 	} else {
 		conn.Close()
