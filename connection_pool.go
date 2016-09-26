@@ -15,10 +15,11 @@ type backend struct {
 
 	// Used for storing links to all connections we ever make, this is a debugging
 	// tool to try to help find leaks of connections. All access is protected by mu.
-	mu        *sync.Mutex
-	conns     []*connection
-	counter   int
-	debugTime time.Time
+	mu             *sync.Mutex
+	conns          []*connection
+	counter        int
+	debugTime      time.Time
+	debugNumHitMax int
 }
 
 // getIdleConnection returns a connection if and only if there is an active, idle connection
@@ -73,20 +74,24 @@ func (b *backend) debugHitMaxConnections() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	if time.Now().Before(b.debugTime) {
+	b.debugNumHitMax += 1
+	now := time.Now()
+	if now.Before(b.debugTime) {
 		return
 	}
-	b.debugTime = time.Now().Add(10 * time.Second)
+	b.debugTime = now.Add(30 * time.Second)
 
 	log.Warn("DEBUG: hit max connections",
 		"counter", b.counter,
-		"len(conns)", len(b.conns))
+		"len(conns)", len(b.conns),
+		"debugNumHitMax", b.debugNumHitMax)
+
 	for idx, conn := range b.conns {
 		log.Warn("DEBUG: connection",
 			"idx", idx,
-			"conn", conn,
-			"closed", conn.IsClosed(),
-			"age", time.Now().Sub(conn.StartTime()))
+			"conn.addr", conn.addr,
+			"conn.closed", conn.IsClosed(),
+			"age", now.Sub(conn.StartTime()))
 	}
 }
 
