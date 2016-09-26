@@ -208,6 +208,17 @@ func (b *backend) NumOpenConnections() int {
 	return b.counter
 }
 
+// Close shuts down all connections.
+func (b *backend) Close() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	for _, conn := range b.conns {
+		conn.Close()
+	}
+	b.counter = 0
+}
+
 // connectionPool is a way for us to manage multiple connections to a Kafka broker in a way
 // that balances out throughput with overall number of connections.
 type connectionPool struct {
@@ -215,10 +226,14 @@ type connectionPool struct {
 
 	// mu protects the below members of this struct. This mutex must only be used by
 	// connectionPool.
-	mu       *sync.RWMutex
-	closed   bool
+	mu     *sync.RWMutex
+	closed bool
+	// Addrs is the set of valid connection destinations, as specified by InitializeAddrs.
+	// Populating this set does not initiate a connection. If an addr is removed from this set,
+	// any active backend pointing to it will be closed.
+	addrs map[string]struct{}
+	// Backends is the subset of addrs to which we have active connections.
 	backends map[string]*backend
-	addrs    []string
 }
 
 // newConnectionPool creates a connection pool and initializes it.
@@ -227,7 +242,7 @@ func newConnectionPool(conf BrokerConf) connectionPool {
 		conf:     conf,
 		mu:       &sync.RWMutex{},
 		backends: make(map[string]*backend),
-		addrs:    make([]string, 0),
+		addrs:    make(map[string]struct{}),
 	}
 }
 
@@ -273,8 +288,16 @@ func (cp *connectionPool) getOrCreateBackend(addr string) *backend {
 		return nil
 	}
 
+	// If the addr being requested is not in the set of valid addrs, do not connect to it.
+	// This is possible when a metadata refresh removes an old addr but there are still in flight
+	// requests to connect to it.
+	if _, ok := cp.addrs[addr]; !ok {
+		log.Warn("Refusing to create backend to unknown addr", "addr", addr)
+		return nil
+	}
+
 	if _, ok := cp.backends[addr]; !ok {
-		cp.addrs = append(cp.addrs, addr)
+		cp.addrs[addr] = struct{}{}
 		cp.backends[addr] = cp.newBackend(addr)
 	}
 	return cp.backends[addr]
@@ -287,7 +310,11 @@ func (cp *connectionPool) GetAllAddrs() []string {
 	defer cp.mu.RUnlock()
 
 	ret := make([]string, len(cp.addrs))
-	copy(ret, cp.addrs)
+	i := 0
+	for addr := range cp.addrs {
+		ret[i] = addr
+		i++
+	}
 	return ret
 }
 
@@ -298,11 +325,26 @@ func (cp *connectionPool) InitializeAddrs(addrs []string) {
 	cp.mu.Lock()
 	defer cp.mu.Unlock()
 
+	deletedAddrs := make(map[string]struct{})
+	for addr := range cp.addrs {
+		deletedAddrs[addr] = struct{}{}
+	}
+
 	for _, addr := range addrs {
+		delete(deletedAddrs, addr)
 		if _, ok := cp.backends[addr]; !ok {
-			cp.addrs = append(cp.addrs, addr)
+			log.Info("Initializing backend to addr", "addr", addr)
+			cp.addrs[addr] = struct{}{}
 			cp.backends[addr] = cp.newBackend(addr)
 		}
+	}
+	for addr := range deletedAddrs {
+		log.Warn("Removing backend for addr", "addr", addr)
+		if backend, ok := cp.backends[addr]; ok {
+			backend.Close()
+			delete(cp.backends, addr)
+		}
+		delete(cp.addrs, addr)
 	}
 }
 
@@ -344,17 +386,10 @@ func (cp *connectionPool) Close() {
 	defer cp.mu.Unlock()
 
 	for _, backend := range cp.backends {
-	Loop:
-		for {
-			select {
-			case conn := <-backend.channel:
-				defer conn.Close()
-			default:
-				break Loop
-			}
-		}
+		backend.Close()
 	}
-
+	cp.addrs = nil
+	cp.backends = nil
 	cp.closed = true
 }
 
