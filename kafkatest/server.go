@@ -435,8 +435,11 @@ func (s *Server) handleFetchRequest(
 			}
 			respParts[pi].TipOffset = int64(len(messages))
 			respParts[pi].Messages = messages[part.FetchOffset:]
-			log.Infof("fetched %d messages from %s:%d at offset %d",
-				len(respParts[pi].Messages), topic.Name, part.ID, part.FetchOffset)
+			numFetched := len(respParts[pi].Messages)
+			if numFetched > 0 || !strings.HasPrefix(topic.Name, "__") {
+				log.Infof("fetched %d messages from %s:%d at offset %d",
+					numFetched, topic.Name, part.ID, part.FetchOffset)
+			}
 		}
 	}
 
