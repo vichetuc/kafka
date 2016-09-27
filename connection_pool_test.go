@@ -83,3 +83,15 @@ func (s *ConnectionPoolSuite) TestConnectionLimit(c *C) {
 	cp.Idle(conn)
 	c.Assert(be.NumOpenConnections(), Equals, 0)
 }
+
+func (s *ConnectionPoolSuite) TestTrimDeadAddrs(c *C) {
+	cp := newConnectionPool(NewBrokerConf("foo"))
+	cp.InitializeAddrs([]string{"foo", "bar", "baz"})
+	c.Assert(len(cp.GetAllAddrs()), Equals, 3)
+	c.Assert(cp.getBackend("foo"), Not(IsNil))
+	c.Assert(cp.getBackend("qux"), IsNil)
+	cp.InitializeAddrs([]string{"qux"})
+	c.Assert(len(cp.GetAllAddrs()), Equals, 1)
+	c.Assert(cp.getBackend("qux"), Not(IsNil))
+	c.Assert(cp.getBackend("foo"), IsNil)
+}

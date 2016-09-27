@@ -985,7 +985,7 @@ func (s *BrokerSuite) TestPartitionOffsetClosedConnection(c *C) {
 	c.Assert(handlerErr, IsNil)
 	c.Assert(err, IsNil)
 	c.Assert(offset, Equals, int64(123))
-	c.Assert(len(broker.conns.addrs), Equals, 2)
+	c.Assert(len(broker.conns.backends), Equals, 2)
 
 	srv1.Close()
 
