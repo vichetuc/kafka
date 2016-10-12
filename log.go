@@ -1,22 +1,21 @@
 package kafka
 
-// Logger is general logging interface that can be provided by popular logging
-// frameworks.
-//
-// * https://github.com/go-kit/kit/tree/master/log
-// * https://github.com/husio/log
-type Logger interface {
-	Debug(msg string, args ...interface{})
-	Info(msg string, args ...interface{})
-	Warn(msg string, args ...interface{})
-	Error(msg string, args ...interface{})
-}
+import (
+	"sync"
 
-// nullLogger implements Logger interface, but discards all messages
-type nullLogger struct {
-}
+	"github.com/op/go-logging"
+)
 
-func (nullLogger) Debug(msg string, args ...interface{}) {}
-func (nullLogger) Info(msg string, args ...interface{})  {}
-func (nullLogger) Warn(msg string, args ...interface{})  {}
-func (nullLogger) Error(msg string, args ...interface{}) {}
+var log *logging.Logger
+var logMu = &sync.Mutex{}
+
+func init() {
+	logMu.Lock()
+	defer logMu.Unlock()
+
+	if log != nil {
+		return
+	}
+	log = logging.MustGetLogger("KafkaClient")
+	logging.SetLevel(logging.INFO, "KafkaClient")
+}
